@@ -64,24 +64,78 @@ printf 'input: %s (%s)\n' "$(basename "$BIG")" "$(du -h "$BIG" | cut -f1)"
 printf 'threads: %s   reps: %s (best of)\n\n' "$THREADS" "$REPS"
 
 # ------------------------------------------------------------------ timing --
-best() { # best <command string> -> seconds
-  local b=999999 t
+#
+# Reporting a speedup without resource usage is misleading: a tool can be
+# faster because it is better, or just because it was handed more cores. So
+# every run records wall time, CPU seconds and peak thread count.
+#
+# CPU comes from the shell's own `times` accounting, which is exact kernel
+# rusage at reap time rather than a sampled estimate. It only works when
+# `times` runs in THIS shell, so run_once reports through globals instead of
+# stdout -- $(run_once ...) would put it in a subshell and read back zero.
+# Timestamps use $EPOCHREALTIME so nothing forks between the two snapshots.
+
+RUN_WALL=0 RUN_CPU=0 RUN_THREADS=1
+
+cpu_snapshot() { # <file> -> child user+sys seconds
+  awk 'NR==2{split($1,u,/[ms]/); split($2,s,/[ms]/);
+             printf "%.3f", u[1]*60+u[2]+s[1]*60+s[2]}' "$1"
+}
+
+run_once() { # run_once <command string>; sets RUN_WALL RUN_CPU RUN_THREADS
+  local start end pid poller rc
+  times > "$OUT/t0"
+  start=$EPOCHREALTIME
+  # `exec` so that $! is the benchmarked process itself. Plain `eval ... &`
+  # backgrounds a wrapper subshell and $! names that instead, which makes the
+  # thread count below read 1 for every tool.
+  eval "exec $1" >/dev/null 2>"$OUT/cmd.err" &
+  pid=$!
+  # Peak thread count, sampled from /proc in a subshell so it cannot delay the
+  # wall-clock measurement. Every read here is a bash builtin.
+  (
+    peak=1
+    while [[ -d /proc/$pid/task ]]; do
+      tasks=(/proc/"$pid"/task/*)
+      # `if`, not `&&`: a false (( )) returns 1, which under `set -e` would
+      # kill this subshell on the first sample that is not a new maximum.
+      if (( ${#tasks[@]} > peak )); then peak=${#tasks[@]}; fi
+      sleep 0.02
+    done
+    echo "$peak" > "$OUT/peak"
+  ) &
+  poller=$!
+  rc=0
+  wait "$pid" || rc=$?
+  # Snapshot before reaping the poller, so only the benchmarked command's CPU
+  # lands in the difference.
+  times > "$OUT/t1"
+  end=$EPOCHREALTIME
+  wait "$poller" 2>/dev/null || true
+
+  if [[ $rc -ne 0 ]]; then
+    echo >&2
+    echo "benchmark aborted: command failed (exit $rc)" >&2
+    echo "  $1" >&2
+    sed 's/^/  /' "$OUT/cmd.err" >&2
+    exit 1
+  fi
+  RUN_WALL=$(echo "$end - $start" | bc)
+  RUN_CPU=$(echo "$(cpu_snapshot "$OUT/t1") - $(cpu_snapshot "$OUT/t0")" | bc)
+  RUN_THREADS=$(cat "$OUT/peak" 2>/dev/null || echo 1)
+  rm -f "$OUT/peak"
+}
+
+# Best-of-REPS wall time, keeping the resource figures from the fastest run.
+BEST_WALL=0 BEST_CPU=0 BEST_THREADS=1
+best() { # best <command string>; sets BEST_*
+  BEST_WALL=999999
   for _ in $(seq "$REPS"); do
-    local s=$(date +%s.%N)
-    # A benchmark that times a failing command is worse than no benchmark:
-    # refuse to report a number for a command that did not succeed.
-    if ! eval "$1" >/dev/null 2>"$OUT/cmd.err"; then
-      echo >&2
-      echo "benchmark aborted: command failed" >&2
-      echo "  $1" >&2
-      sed 's/^/  /' "$OUT/cmd.err" >&2
-      exit 1
+    run_once "$1"
+    if [[ $(echo "$RUN_WALL < $BEST_WALL" | bc) -eq 1 ]]; then
+      BEST_WALL=$RUN_WALL BEST_CPU=$RUN_CPU BEST_THREADS=$RUN_THREADS
     fi
-    local e=$(date +%s.%N)
-    t=$(echo "$e - $s" | bc)
-    b=$(echo "if ($t < $b) $t else $b" | bc)
   done
-  printf '%.2f' "$b"
 }
 
 hdr() {
@@ -92,17 +146,23 @@ hdr "----------------------------------------" "----------" "----------" "------
 
 # row <label> <bcftools cmd> <vcfr cmd>
 #
-# When both commands wrote $OUT/b.vcf.gz and $OUT/v.vcf.gz the sizes are
-# reported too: a BGZF speedup means nothing without knowing how hard each
-# tool compressed.
+# Prints wall time and speedup, then what each tool spent to get there: peak OS
+# threads, CPU seconds and average cores in use. When both commands wrote
+# $OUT/{b,v}.vcf.gz their sizes are shown too, since a BGZF speedup means
+# nothing without knowing how hard each tool compressed.
 row() {
-  local bt vt sizes=""
+  local sizes="" bt bc bp vt vc vp
   rm -f "$OUT/b.vcf.gz" "$OUT/v.vcf.gz"
-  bt=$(best "$2"); vt=$(best "$3")
+  best "$2"; bt=$BEST_WALL bc=$BEST_CPU bp=$BEST_THREADS
+  best "$3"; vt=$BEST_WALL vc=$BEST_CPU vp=$BEST_THREADS
   if [[ -s $OUT/b.vcf.gz && -s $OUT/v.vcf.gz ]]; then
     sizes="$(du -h "$OUT/b.vcf.gz" | cut -f1) / $(du -h "$OUT/v.vcf.gz" | cut -f1)"
   fi
-  printf '%-40s %9ss %9ss %8sx  %s\n' "$1" "$bt" "$vt" "$(echo "scale=2; $bt / $vt" | bc)" "$sizes"
+  printf '%-40s %9.2fs %9.2fs %8sx  %s\n' \
+    "$1" "$bt" "$vt" "$(echo "scale=2; $bt / $vt" | bc)" "$sizes"
+  printf '%-40s   bcftools %2s thr %7ss cpu %5s cores  |  vcfr %2s thr %7ss cpu %5s cores\n' \
+    "" "$bp" "$bc" "$(echo "scale=2; $bc / $bt" | bc)" \
+       "$vp" "$vc" "$(echo "scale=2; $vc / $vt" | bc)"
 }
 
 row "view: decompress to VCF" \
@@ -176,7 +236,7 @@ echo
 echo "compression calibration (BGZF re-compress, $THREADS threads, 1 run):"
 printf '%-28s %10s %14s\n' "encoder" "time" "output bytes"
 printf '%-28s %10s %14s\n' "----------------------------" "----------" "--------------"
-one() { local s e; s=$(date +%s.%N); eval "$1" >/dev/null 2>&1; e=$(date +%s.%N); printf '%.2f' "$(echo "$e - $s" | bc)"; }
+one() { run_once "$1"; printf '%.2f' "$RUN_WALL"; }
 d=$(one "bcftools view --threads $THREADS -O z -o $OUT/cal.gz $BIG")
 printf '%-28s %9ss %14s\n' "bcftools -Oz (zlib 6)" "$d" "$(stat -c %s "$OUT/cal.gz")"
 for L in 6 7 8; do

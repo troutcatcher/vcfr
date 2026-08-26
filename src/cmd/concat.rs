@@ -43,7 +43,7 @@ pub fn run(a: &ConcatArgs) -> Result<(), String> {
     // start emitting output.
     let mut headers = Vec::with_capacity(inputs.len());
     for p in &inputs {
-        let mut r = open_reader(p, 1).map_err(|e| e.to_string())?;
+        let mut r = open_reader(p, 0).map_err(|e| e.to_string())?;
         headers.push(Header::read(&mut r).map_err(|e| format!("{p}: {e}"))?);
     }
     for (p, h) in inputs.iter().zip(&headers).skip(1) {

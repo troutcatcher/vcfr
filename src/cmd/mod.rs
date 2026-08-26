@@ -40,18 +40,35 @@ impl OutputOpts {
 
 /// Split a thread budget between the reader and the writer.
 ///
+/// Both numbers count *worker* threads, so `--threads 1` really is one thread:
+/// zero workers means the main thread does that half of the job itself.
+///
 /// Deflating costs several times more than inflating, so when the output is
 /// BGZF most of the budget goes to the writer; with plain output the writer
 /// needs none at all.
 pub fn split_threads(total: usize, bgzf_out: bool) -> (usize, usize) {
     if total <= 1 {
-        return (1, 1);
+        return (0, 0);
     }
     if !bgzf_out {
-        return (total, 1);
+        return (total, 0);
     }
     let read = (total / 3).max(1);
     (read, (total - read).max(1))
+}
+
+/// Thread budget for a k-way merge.
+///
+/// Reader workers are latency-hiding rather than throughput-consuming: they
+/// spend most of the run blocked, and their only job is to keep inflation off
+/// the main thread, which is the merge's serial bottleneck. So every input gets
+/// at least one, and they are not charged against the writer's share.
+pub fn merge_threads(total: usize, inputs: usize, bgzf_out: bool) -> (usize, usize) {
+    if total <= 1 {
+        return (0, 0);
+    }
+    let per_file = ((total / 2) / inputs.max(1)).max(1);
+    (per_file, if bgzf_out { total } else { 0 })
 }
 
 /// Resolve `--threads 0` to the machine's parallelism.

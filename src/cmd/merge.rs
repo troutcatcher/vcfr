@@ -1,5 +1,6 @@
 //! `vcfr merge` — combine files that hold different samples at the same sites.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::Write;
 
@@ -7,7 +8,7 @@ use crate::io::{open_reader, Reader};
 use crate::vcf::header::{union_meta, Header, Number};
 use crate::vcf::record::*;
 
-use super::{ignore_broken_pipe, resolve_threads, split_threads, OutputOpts};
+use super::{ignore_broken_pipe, merge_threads, resolve_threads, OutputOpts};
 
 #[derive(clap::Args, Debug)]
 pub struct MergeArgs {
@@ -260,9 +261,7 @@ struct Ctx {
     /// Per member: union key index -> that member's subfield index.
     key_pos: Vec<Vec<Option<usize>>>,
     gts: Vec<i32>,
-    samples_buf: Vec<u8>,
     info_buf: Vec<u8>,
-    vals: Vec<Vec<u8>>,
     ac: Vec<u64>,
 }
 
@@ -272,10 +271,9 @@ pub fn run(a: &MergeArgs) -> Result<(), String> {
         return Err("merge needs at least two input files".into());
     }
     let threads = resolve_threads(a.threads);
-    // Every input is read concurrently, so the reader budget is shared between
-    // them and the rest goes to the writer.
-    let (rthreads, wthreads) = split_threads(threads, a.out.bgzf()?);
-    let per_file = (rthreads / inputs.len()).max(1);
+    // Inflation must not run on the main thread: assembling merged records is
+    // the serial bottleneck, so every input gets its own inflation worker.
+    let (per_file, wthreads) = merge_threads(threads, inputs.len(), a.out.bgzf()?);
 
     let mut headers = Vec::with_capacity(inputs.len());
     let mut readers = Vec::with_capacity(inputs.len());
@@ -453,79 +451,101 @@ fn emit(
 ) -> Result<(), String> {
     let first = &streams[members[0]];
 
-    // --- ALT union and per-member allele renumbering ---------------------
-    ctx.alts.clear();
-    ctx.maps.clear();
-    ctx.identity.clear();
-    for &m in members {
+    // Almost always every input describes the site identically. When it does,
+    // there is nothing to renumber and no FORMAT union to take, so the whole
+    // remapping apparatus below can be skipped and each input's sample columns
+    // copied across in one memcpy.
+    let first_alt = first.get(COL_ALT);
+    let first_fmt: &[u8] = if first.rec.ncols() > COL_FORMAT { first.get(COL_FORMAT) } else { b"" };
+    let uniform = members.iter().skip(1).all(|&m| {
         let s = &streams[m];
-        let alt = s.get(COL_ALT);
-        let mut map = vec![0i32; 1];
-        let mut ident = true;
-        if alt != b"." && !alt.is_empty() {
-            for (old, al) in alt.split(|&b| b == b',').enumerate() {
-                let idx = match ctx.alts.iter().position(|x| x == al) {
-                    Some(i) => i,
-                    None => {
-                        ctx.alts.push(al.to_vec());
-                        ctx.alts.len() - 1
-                    }
-                };
-                if idx != old {
-                    ident = false;
-                }
-                map.push(idx as i32 + 1);
-            }
-        }
-        ctx.maps.push(map);
-        ctx.identity.push(ident);
-    }
-    let n_alt = ctx.alts.len();
-    // A member only passes through unchanged if it also carries every allele.
-    for (mi, _) in members.iter().enumerate() {
-        ctx.identity[mi] = ctx.identity[mi] && ctx.maps[mi].len() == n_alt + 1;
-    }
+        s.get(COL_ALT) == first_alt
+            && (if s.rec.ncols() > COL_FORMAT { s.get(COL_FORMAT) } else { b"" }) == first_fmt
+    });
 
-    // --- FORMAT union ----------------------------------------------------
-    ctx.fmt_keys.clear();
-    let mut has_gt = false;
-    for &m in members {
-        let s = &streams[m];
-        if s.rec.ncols() <= COL_FORMAT {
-            continue;
+    let n_alt;
+    let gt_slot;
+    let n_keys;
+    ctx.identity.clear();
+    if uniform {
+        n_alt = count_alts(first_alt);
+        gt_slot = gt_index(first_fmt);
+        n_keys = if first_fmt.is_empty() { 0 } else { first_fmt.iter().filter(|&&b| b == b':').count() + 1 };
+        ctx.identity.resize(members.len(), true);
+    } else {
+        // --- ALT union and per-member allele renumbering ---------------------
+        ctx.alts.clear();
+        ctx.maps.clear();
+        for &m in members {
+            let s = &streams[m];
+            let alt = s.get(COL_ALT);
+            let mut map = vec![0i32; 1];
+            let mut ident = true;
+            if alt != b"." && !alt.is_empty() {
+                for (old, al) in alt.split(|&b| b == b',').enumerate() {
+                    let idx = match ctx.alts.iter().position(|x| x == al) {
+                        Some(i) => i,
+                        None => {
+                            ctx.alts.push(al.to_vec());
+                            ctx.alts.len() - 1
+                        }
+                    };
+                    if idx != old {
+                        ident = false;
+                    }
+                    map.push(idx as i32 + 1);
+                }
+            }
+            ctx.maps.push(map);
+            ctx.identity.push(ident);
         }
-        for k in s.get(COL_FORMAT).split(|&b| b == b':') {
-            if k == b"GT" {
-                has_gt = true;
+        n_alt = ctx.alts.len();
+        // A member only passes through unchanged if it also carries every allele.
+        for mi in 0..members.len() {
+            ctx.identity[mi] = ctx.identity[mi] && ctx.maps[mi].len() == n_alt + 1;
+        }
+
+        // --- FORMAT union ----------------------------------------------------
+        ctx.fmt_keys.clear();
+        let mut has_gt = false;
+        for &m in members {
+            let s = &streams[m];
+            if s.rec.ncols() <= COL_FORMAT {
                 continue;
             }
-            if !ctx.fmt_keys.iter().any(|x| x == k) {
-                ctx.fmt_keys.push(k.to_vec());
+            for k in s.get(COL_FORMAT).split(|&b| b == b':') {
+                if k == b"GT" {
+                    has_gt = true;
+                    continue;
+                }
+                if !ctx.fmt_keys.iter().any(|x| x == k) {
+                    ctx.fmt_keys.push(k.to_vec());
+                }
             }
         }
+        if has_gt || ctx.fmt_keys.is_empty() {
+            ctx.fmt_keys.insert(0, b"GT".to_vec());
+        }
+        ctx.key_pos.clear();
+        for &m in members {
+            let s = &streams[m];
+            let own: Vec<&[u8]> = if s.rec.ncols() > COL_FORMAT {
+                s.get(COL_FORMAT).split(|&b| b == b':').collect()
+            } else {
+                Vec::new()
+            };
+            ctx.key_pos.push(
+                ctx.fmt_keys
+                    .iter()
+                    .map(|k| own.iter().position(|o| *o == &k[..]))
+                    .collect(),
+            );
+        }
+        gt_slot = ctx.fmt_keys.iter().position(|k| k == b"GT");
+        n_keys = ctx.fmt_keys.len();
     }
-    if has_gt || ctx.fmt_keys.is_empty() {
-        ctx.fmt_keys.insert(0, b"GT".to_vec());
-    }
-    ctx.key_pos.clear();
-    for &m in members {
-        let s = &streams[m];
-        let own: Vec<&[u8]> = if s.rec.ncols() > COL_FORMAT {
-            s.get(COL_FORMAT).split(|&b| b == b':').collect()
-        } else {
-            Vec::new()
-        };
-        ctx.key_pos.push(
-            ctx.fmt_keys
-                .iter()
-                .map(|k| own.iter().position(|o| *o == &k[..]))
-                .collect(),
-        );
-    }
-    let gt_slot = ctx.fmt_keys.iter().position(|k| k == b"GT");
 
     // --- sample columns --------------------------------------------------
-    ctx.samples_buf.clear();
     ctx.ac.clear();
     ctx.ac.resize(n_alt, 0);
     let mut an = 0u64;
@@ -539,7 +559,7 @@ fn emit(
             if s.rec.ncols() <= FIRST_SAMPLE {
                 continue;
             }
-            if let Some(si) = ctx.key_pos[mi][slot] {
+            if let Some(si) = if uniform { Some(slot) } else { ctx.key_pos[mi][slot] } {
                 for j in 0..s.n_samples {
                     let col = FIRST_SAMPLE + j;
                     if col >= s.rec.ncols() {
@@ -559,64 +579,44 @@ fn emit(
         ploidy = 2;
     }
 
-    let mut next_out_sample = 0usize;
-    for (mi, &m) in members.iter().enumerate() {
-        let s = &streams[m];
-        while next_out_sample < s.sample_off {
-            push_missing(&mut ctx.samples_buf, &ctx.fmt_keys, gt_slot, ploidy, a.missing_to_ref);
-            if update && a.missing_to_ref {
-                an += ploidy as u64;
-            }
-            next_out_sample += 1;
-        }
-        let passthrough = ctx.identity[mi]
-            && s.rec.ncols() > COL_FORMAT
-            && format_matches(s.get(COL_FORMAT), &ctx.fmt_keys);
-        for j in 0..s.n_samples {
-            let col = FIRST_SAMPLE + j;
-            let field: &[u8] = if col < s.rec.ncols() { s.get(col) } else { b"." };
-            ctx.samples_buf.push(b'\t');
-            if passthrough {
-                ctx.samples_buf.extend_from_slice(field);
-            } else {
-                write_sample(
-                    &mut ctx.samples_buf,
-                    field,
-                    &ctx.fmt_keys,
-                    &ctx.key_pos[mi],
-                    &ctx.maps[mi],
-                    ctx.identity[mi],
-                    n_alt,
-                    hdr,
-                    ploidy,
-                );
-            }
-            if update {
-                if let Some(slot) = gt_slot {
-                    if let Some(si) = ctx.key_pos[mi][slot] {
-                        parse_gt(subfield(field, si), &mut ctx.gts);
-                        for &al in ctx.gts.iter() {
-                            if al < 0 {
-                                continue;
-                            }
-                            an += 1;
-                            let mapped = ctx.maps[mi].get(al as usize).copied().unwrap_or(-1);
-                            if mapped > 0 && (mapped as usize) <= n_alt {
-                                ctx.ac[mapped as usize - 1] += 1;
-                            }
-                        }
+    // Allele counts have to be known before INFO is written, and INFO precedes
+    // the genotypes on the line. Counting them in their own pass lets the
+    // genotype columns go straight into the output buffer below, instead of
+    // being staged in a second buffer and copied again.
+    if update {
+        for (mi, &m) in members.iter().enumerate() {
+            let s = &streams[m];
+            let si = match gt_slot.and_then(|slot| if uniform { Some(slot) } else { ctx.key_pos[mi][slot] }) {
+                Some(si) => si,
+                None => continue,
+            };
+            for j in 0..s.n_samples {
+                let col = FIRST_SAMPLE + j;
+                if col >= s.rec.ncols() {
+                    break;
+                }
+                parse_gt(subfield(s.get(col), si), &mut ctx.gts);
+                for &al in ctx.gts.iter() {
+                    if al < 0 {
+                        continue;
+                    }
+                    an += 1;
+                    let mapped = if ctx.identity[mi] {
+                        al
+                    } else {
+                        ctx.maps[mi].get(al as usize).copied().unwrap_or(-1)
+                    };
+                    if mapped > 0 && (mapped as usize) <= n_alt {
+                        ctx.ac[mapped as usize - 1] += 1;
                     }
                 }
             }
-            next_out_sample += 1;
         }
-    }
-    while next_out_sample < n_out {
-        push_missing(&mut ctx.samples_buf, &ctx.fmt_keys, gt_slot, ploidy, a.missing_to_ref);
-        if update && a.missing_to_ref {
-            an += ploidy as u64;
+        if a.missing_to_ref {
+            // Samples no input covers are called 0/0, so they contribute alleles.
+            let covered: usize = members.iter().map(|&m| streams[m].n_samples).sum();
+            an += (n_out.saturating_sub(covered) * ploidy) as u64;
         }
-        next_out_sample += 1;
     }
 
     // --- fixed columns ----------------------------------------------------
@@ -628,7 +628,9 @@ fn emit(
     out.push(b'\t');
     out.extend_from_slice(first.get(COL_REF));
     out.push(b'\t');
-    if n_alt == 0 {
+    if uniform {
+        out.extend_from_slice(first_alt);
+    } else if n_alt == 0 {
         out.push(b'.');
     } else {
         for (i, al) in ctx.alts.iter().enumerate() {
@@ -658,7 +660,6 @@ fn emit(
         hdr,
         rules,
         skip,
-        &mut ctx.vals,
     );
     if update {
         if ctx.info_buf == b"." {
@@ -677,13 +678,60 @@ fn emit(
     // With no samples anywhere the record is sites-only and has no FORMAT.
     if n_out > 0 {
         out.push(b'\t');
-        for (i, k) in ctx.fmt_keys.iter().enumerate() {
-            if i > 0 {
-                out.push(b':');
+        if uniform {
+            out.extend_from_slice(first_fmt);
+        } else {
+            for (i, k) in ctx.fmt_keys.iter().enumerate() {
+                if i > 0 {
+                    out.push(b':');
+                }
+                out.extend_from_slice(k);
             }
-            out.extend_from_slice(k);
         }
-        out.extend_from_slice(&ctx.samples_buf);
+
+        let mut next_out_sample = 0usize;
+        for (mi, &m) in members.iter().enumerate() {
+            let s = &streams[m];
+            while next_out_sample < s.sample_off {
+                push_missing(out, n_keys, gt_slot, ploidy, a.missing_to_ref);
+                next_out_sample += 1;
+            }
+            let passthrough = ctx.identity[mi]
+                && s.rec.ncols() > COL_FORMAT
+                && (uniform || format_matches(s.get(COL_FORMAT), &ctx.fmt_keys));
+            if passthrough && s.rec.ncols() == FIRST_SAMPLE + s.n_samples && s.n_samples > 0 {
+                // Every sample column is reproduced verbatim, so copy the whole
+                // run of them, tab separators included, in one memcpy.
+                out.push(b'\t');
+                out.extend_from_slice(s.rec.span(&s.line, FIRST_SAMPLE, s.rec.ncols() - 1));
+            } else {
+                for j in 0..s.n_samples {
+                    let col = FIRST_SAMPLE + j;
+                    let field: &[u8] = if col < s.rec.ncols() { s.get(col) } else { b"." };
+                    out.push(b'\t');
+                    if passthrough {
+                        out.extend_from_slice(field);
+                    } else {
+                        write_sample(
+                            out,
+                            field,
+                            &ctx.fmt_keys,
+                            &ctx.key_pos[mi],
+                            &ctx.maps[mi],
+                            ctx.identity[mi],
+                            n_alt,
+                            hdr,
+                            ploidy,
+                        );
+                    }
+                }
+            }
+            next_out_sample += s.n_samples;
+        }
+        while next_out_sample < n_out {
+            push_missing(out, n_keys, gt_slot, ploidy, a.missing_to_ref);
+            next_out_sample += 1;
+        }
     }
     out.push(b'\n');
     Ok(())
@@ -700,9 +748,9 @@ fn format_matches(fmt: &[u8], keys: &[Vec<u8>]) -> bool {
     it.next().is_none()
 }
 
-fn push_missing(out: &mut Vec<u8>, keys: &[Vec<u8>], gt_slot: Option<usize>, ploidy: usize, to_ref: bool) {
+fn push_missing(out: &mut Vec<u8>, n_keys: usize, gt_slot: Option<usize>, ploidy: usize, to_ref: bool) {
     out.push(b'\t');
-    for (i, _) in keys.iter().enumerate() {
+    for i in 0..n_keys {
         if i > 0 {
             out.push(b':');
         }
@@ -901,16 +949,30 @@ fn write_filter(out: &mut Vec<u8>, streams: &[Stream], members: &[usize]) {
     }
 }
 
+/// One INFO key at this site, gathered across the records being merged.
+struct InfoEntry<'a> {
+    key: &'a [u8],
+    /// `None` for a flag.
+    first: Option<Cow<'a, [u8]>>,
+    /// Values from the remaining records. Only filled for keys whose result
+    /// actually depends on more than the first record, which keeps this empty
+    /// — and therefore unallocated — for most keys.
+    extra: Vec<Cow<'a, [u8]>>,
+    rule: Option<Rule>,
+    per_allele: bool,
+}
+
 /// Combine the INFO columns of every record at this site.
 ///
-/// A key listed in `--info-rules` is folded across all contributing records;
-/// otherwise the first record that carries it wins. Per-allele values are
-/// renumbered onto the merged ALT list first, so the rules see comparable
-/// vectors.
+/// A key listed in `--info-rules` is folded across all contributing records,
+/// and a per-allele key takes each slot from the first record that has one;
+/// every other key is simply the first record's value. Per-allele values are
+/// renumbered onto the merged ALT list before any of that, so the rules see
+/// comparable vectors.
 #[allow(clippy::too_many_arguments)]
-fn merge_info(
+fn merge_info<'a>(
     out: &mut Vec<u8>,
-    streams: &[Stream],
+    streams: &'a [Stream],
     members: &[usize],
     maps: &[Vec<i32>],
     identity: &[bool],
@@ -918,11 +980,8 @@ fn merge_info(
     hdr: &Header,
     rules: &InfoRules,
     skip: &[&[u8]],
-    scratch: &mut Vec<Vec<u8>>,
 ) {
-    // Keys in order of first appearance, each with the records that carry it.
-    let mut keys: Vec<(Vec<u8>, Option<Number>)> = Vec::new();
-    let mut vals: Vec<Vec<Option<Vec<u8>>>> = Vec::new();
+    let mut entries: Vec<InfoEntry<'a>> = Vec::new();
     for (mi, &m) in members.iter().enumerate() {
         let info = streams[m].get(COL_INFO);
         if info == b"." || info.is_empty() {
@@ -945,9 +1004,11 @@ fn merge_info(
             if !identity[mi] && number == Some(Number::G) {
                 continue;
             }
-            let remapped = val.map(|v| {
+            let per_allele = matches!(number, Some(Number::A) | Some(Number::R));
+            // Borrow the value unless this record's alleles were renumbered.
+            let value: Option<Cow<'a, [u8]>> = val.map(|v| {
                 if identity[mi] {
-                    v.to_vec()
+                    Cow::Borrowed(v)
                 } else {
                     let mut b = Vec::with_capacity(v.len());
                     match number {
@@ -955,117 +1016,143 @@ fn merge_info(
                         Some(Number::R) => remap_values(v, &maps[mi], n_alt + 1, 0, &mut b),
                         _ => b.extend_from_slice(v),
                     }
-                    b
+                    Cow::Owned(b)
                 }
             });
-            match keys.iter().position(|(k, _)| k == key) {
-                Some(i) => vals[i].push(remapped),
-                None => {
-                    keys.push((key.to_vec(), number));
-                    vals.push(vec![remapped]);
+            match entries.iter_mut().find(|e| e.key == key) {
+                Some(e) => {
+                    if e.rule.is_some() || e.per_allele {
+                        if let Some(v) = value {
+                            e.extra.push(v);
+                        }
+                    }
                 }
+                None => entries.push(InfoEntry {
+                    key,
+                    first: value,
+                    extra: Vec::new(),
+                    rule: rules.get(key),
+                    per_allele,
+                }),
             }
         }
     }
 
-    let mut first = true;
-    for ((key, number), entries) in keys.iter().zip(&vals) {
-        scratch.clear();
-        let rule = rules.get(key);
-        let per_allele = matches!(number, Some(Number::A) | Some(Number::R));
-        let value: Option<Vec<u8>> = match entries[0].as_ref() {
-            None => None, // flag
-            Some(v0) if entries.len() == 1 => Some(v0.clone()),
-            Some(v0) => {
-                for v in entries.iter().flatten() {
-                    scratch.push(v.clone());
-                }
-                match rule {
-                    Some(r) => Some(fold(&scratch, r)),
-                    // Per-allele values describe different alleles in each
-                    // file, so fill each slot from the first file that has it.
-                    None if per_allele => Some(fold_slots(&scratch)),
-                    None => Some(v0.clone()),
-                }
-            }
-        };
-        if !first {
+    let mut first_out = true;
+    let mut all: Vec<&[u8]> = Vec::new();
+    for e in &entries {
+        if !first_out {
             out.push(b';');
         }
-        first = false;
-        out.extend_from_slice(key);
-        if let Some(v) = value {
-            out.push(b'=');
-            out.extend_from_slice(&v);
+        first_out = false;
+        out.extend_from_slice(e.key);
+        let v0 = match &e.first {
+            None => continue, // flag
+            Some(v) => v,
+        };
+        out.push(b'=');
+        if e.extra.is_empty() {
+            out.extend_from_slice(v0);
+            continue;
+        }
+        all.clear();
+        all.push(v0);
+        all.extend(e.extra.iter().map(|c| &c[..]));
+        match e.rule {
+            Some(r) => fold_into(&all, r, out),
+            // Per-allele values describe different alleles in each file, so
+            // fill each slot from the first file that has it.
+            None => fold_slots_into(&all, out),
         }
     }
-    if first {
+    if first_out {
         out.push(b'.');
     }
 }
 
 /// Fold several comma-separated value vectors into one, element by element.
-fn fold(vals: &[Vec<u8>], rule: Rule) -> Vec<u8> {
+fn fold_into(vals: &[&[u8]], rule: Rule, out: &mut Vec<u8>) {
     if rule == Rule::Join {
-        return vals.join(&b","[..]);
+        for (i, v) in vals.iter().enumerate() {
+            if i > 0 {
+                out.push(b',');
+            }
+            out.extend_from_slice(v);
+        }
+        return;
+    }
+    // Scalars are the overwhelmingly common case (DP, DP4 aside), and folding
+    // them needs no per-value splitting.
+    if vals.iter().all(|v| !v.contains(&b',')) {
+        fold_one(vals, rule, out);
+        return;
     }
     let cols: Vec<Vec<&[u8]>> = vals.iter().map(|v| v.split(|&b| b == b',').collect()).collect();
     let width = cols.iter().map(|c| c.len()).max().unwrap_or(0);
-    let mut out = Vec::with_capacity(vals[0].len());
+    let mut slot: Vec<&[u8]> = Vec::with_capacity(cols.len());
     for i in 0..width {
         if i > 0 {
             out.push(b',');
         }
-        let items: Vec<&[u8]> = cols
-            .iter()
-            .filter_map(|c| c.get(i).copied())
-            .filter(|t| *t != b"." && !t.is_empty())
-            .collect();
-        if items.is_empty() {
-            out.push(b'.');
-            continue;
-        }
-        // Integers stay integers; anything else is folded as a float.
-        let ints: Option<Vec<i64>> = items
-            .iter()
-            .map(|t| std::str::from_utf8(t).ok().and_then(|s| s.parse::<i64>().ok()))
-            .collect();
-        match (ints, rule) {
-            (Some(v), Rule::Sum) => out.extend_from_slice(v.iter().sum::<i64>().to_string().as_bytes()),
-            (Some(v), Rule::Min) => out.extend_from_slice(v.iter().min().unwrap().to_string().as_bytes()),
-            (Some(v), Rule::Max) => out.extend_from_slice(v.iter().max().unwrap().to_string().as_bytes()),
-            (Some(v), Rule::Avg) => {
-                let avg = v.iter().sum::<i64>() as f64 / v.len() as f64;
-                out.extend_from_slice(fmt_f64(avg).as_bytes())
-            }
-            (_, _) => {
-                let fs: Vec<f64> = items
-                    .iter()
-                    .filter_map(|t| std::str::from_utf8(t).ok().and_then(|s| s.parse::<f64>().ok()))
-                    .collect();
-                if fs.is_empty() {
-                    out.extend_from_slice(items[0]);
-                } else {
-                    let v = match rule {
-                        Rule::Sum => fs.iter().sum::<f64>(),
-                        Rule::Min => fs.iter().cloned().fold(f64::INFINITY, f64::min),
-                        Rule::Max => fs.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
-                        Rule::Avg => fs.iter().sum::<f64>() / fs.len() as f64,
-                        _ => fs[0],
-                    };
-                    out.extend_from_slice(fmt_f64(v).as_bytes());
-                }
-            }
-        }
+        slot.clear();
+        slot.extend(cols.iter().filter_map(|c| c.get(i).copied()));
+        fold_one(&slot, rule, out);
     }
-    out
+}
+
+/// Fold one position's worth of values.
+fn fold_one(items: &[&[u8]], rule: Rule, out: &mut Vec<u8>) {
+    let present: Vec<&[u8]> = items
+        .iter()
+        .copied()
+        .filter(|t| *t != b"." && !t.is_empty())
+        .collect();
+    if present.is_empty() {
+        out.push(b'.');
+        return;
+    }
+    // Integers stay integers; anything else is folded as a float.
+    let ints: Option<Vec<i64>> = present
+        .iter()
+        .map(|t| std::str::from_utf8(t).ok().and_then(|s| s.parse::<i64>().ok()))
+        .collect();
+    if let Some(v) = ints {
+        let r = match rule {
+            Rule::Sum => v.iter().sum::<i64>(),
+            Rule::Min => *v.iter().min().unwrap(),
+            Rule::Max => *v.iter().max().unwrap(),
+            Rule::Avg => {
+                let avg = v.iter().sum::<i64>() as f64 / v.len() as f64;
+                out.extend_from_slice(fmt_f64(avg).as_bytes());
+                return;
+            }
+            _ => v[0],
+        };
+        out.extend_from_slice(r.to_string().as_bytes());
+        return;
+    }
+    let fs: Vec<f64> = present
+        .iter()
+        .filter_map(|t| std::str::from_utf8(t).ok().and_then(|s| s.parse::<f64>().ok()))
+        .collect();
+    if fs.is_empty() {
+        out.extend_from_slice(present[0]);
+        return;
+    }
+    let v = match rule {
+        Rule::Sum => fs.iter().sum::<f64>(),
+        Rule::Min => fs.iter().cloned().fold(f64::INFINITY, f64::min),
+        Rule::Max => fs.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+        Rule::Avg => fs.iter().sum::<f64>() / fs.len() as f64,
+        _ => fs[0],
+    };
+    out.extend_from_slice(fmt_f64(v).as_bytes());
 }
 
 /// Take each per-allele slot from the first record that supplies one.
-fn fold_slots(vals: &[Vec<u8>]) -> Vec<u8> {
+fn fold_slots_into(vals: &[&[u8]], out: &mut Vec<u8>) {
     let cols: Vec<Vec<&[u8]>> = vals.iter().map(|v| v.split(|&b| b == b',').collect()).collect();
     let width = cols.iter().map(|c| c.len()).max().unwrap_or(0);
-    let mut out = Vec::with_capacity(vals[0].len());
     for i in 0..width {
         if i > 0 {
             out.push(b',');
@@ -1076,7 +1163,6 @@ fn fold_slots(vals: &[Vec<u8>]) -> Vec<u8> {
             .find(|t| *t != b"." && !t.is_empty());
         out.extend_from_slice(pick.unwrap_or(b"."));
     }
-    out
 }
 
 fn fmt_f64(v: f64) -> String {

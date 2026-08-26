@@ -59,11 +59,14 @@ fn raw_source(path: &str) -> io::Result<Box<dyn Read + Send>> {
 }
 
 /// Open a VCF for reading, transparently handling plain, gzip and BGZF input.
-/// `threads` extra threads are used for BGZF inflation (0 or 1 = serial).
-pub fn open_reader(path: &str, threads: usize) -> io::Result<Reader> {
+///
+/// `workers` BGZF inflation threads are spawned; `0` inflates inline on the
+/// calling thread. Even a single worker is worth having when the caller has
+/// other work to do, since it decouples inflation from consumption.
+pub fn open_reader(path: &str, workers: usize) -> io::Result<Reader> {
     let (comp, r) = sniff(raw_source(path)?)?;
     let src: Box<dyn BufSource + Send> = match comp {
-        Compression::Bgzf if threads > 1 => Box::new(BgzfReader::new(r, threads)),
+        Compression::Bgzf if workers >= 1 => Box::new(BgzfReader::new(r, workers)),
         Compression::Bgzf => Box::new(SerialBgzfReader::new(r)),
         Compression::Gzip => Box::new(PlainSource::new(flate2::read::MultiGzDecoder::new(r))),
         Compression::None => Box::new(PlainSource::new(r)),

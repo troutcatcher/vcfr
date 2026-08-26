@@ -7,29 +7,43 @@ use crate::pool::OrderedPool;
 
 pub struct BgzfWriter<W: Write> {
     inner: W,
-    pool: OrderedPool<Vec<u8>>,
+    /// `None` when compressing inline on the calling thread.
+    pool: Option<OrderedPool<Vec<u8>>>,
+    inline: Option<libdeflater::Compressor>,
+    scratch: Vec<u8>,
     buf: Vec<u8>,
     level: i32,
     finished: bool,
 }
 
 impl<W: Write> BgzfWriter<W> {
-    pub fn new(inner: W, threads: usize, level: u32) -> Self {
+    /// `workers` compression threads; `0` deflates inline on the calling
+    /// thread, so a caller asking for one thread really gets one thread.
+    pub fn new(inner: W, workers: usize, level: u32) -> Self {
+        let level = level.clamp(1, 12) as i32;
         BgzfWriter {
             inner,
-            pool: OrderedPool::new(threads, threads * 3),
+            pool: (workers >= 1).then(|| OrderedPool::new(workers, workers * 3)),
+            inline: (workers == 0).then(|| {
+                libdeflater::Compressor::new(
+                    libdeflater::CompressionLvl::new(level).expect("valid compression level"),
+                )
+            }),
+            scratch: Vec::with_capacity(UNCOMPRESSED_BLOCK_SIZE),
             buf: Vec::with_capacity(UNCOMPRESSED_BLOCK_SIZE),
-            level: level.clamp(1, 12) as i32,
+            level,
             finished: false,
         }
     }
 
     /// Drain finished blocks, optionally waiting until the pool has room.
     fn drain(&mut self, until_empty: bool) -> io::Result<()> {
-        while self.pool.outstanding() >= self.pool.capacity()
-            || (until_empty && self.pool.outstanding() > 0)
-        {
-            match self.pool.next() {
+        let pool = match &mut self.pool {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        while pool.outstanding() >= pool.capacity() || (until_empty && pool.outstanding() > 0) {
+            match pool.next() {
                 Some(b) => self.inner.write_all(&b)?,
                 None => break,
             }
@@ -41,9 +55,15 @@ impl<W: Write> BgzfWriter<W> {
         if self.buf.is_empty() {
             return Ok(());
         }
+        if let Some(c) = &mut self.inline {
+            deflate_block(c, &self.buf, &mut self.scratch);
+            self.inner.write_all(&self.scratch)?;
+            self.buf.clear();
+            return Ok(());
+        }
         let data = std::mem::replace(&mut self.buf, Vec::with_capacity(UNCOMPRESSED_BLOCK_SIZE));
         let level = self.level;
-        self.pool.submit(move || {
+        self.pool.as_mut().expect("pool or inline compressor").submit(move || {
             let mut c = libdeflater::Compressor::new(
                 libdeflater::CompressionLvl::new(level).expect("valid compression level"),
             );
