@@ -84,6 +84,11 @@ cpu_snapshot() { # <file> -> child user+sys seconds
 
 run_once() { # run_once <command string>; sets RUN_WALL RUN_CPU RUN_THREADS
   local start end pid poller rc
+  # Flush dirty pages first. These commands write hundreds of megabytes, and
+  # without this a row is timed while the previous row's writeback is still in
+  # flight -- which showed up as the same bcftools invocation taking 22.8s in
+  # one place and 28.2s in another.
+  sync
   times > "$OUT/t0"
   start=$EPOCHREALTIME
   # `exec` so that $! is the benchmarked process itself. Plain `eval ... &`
