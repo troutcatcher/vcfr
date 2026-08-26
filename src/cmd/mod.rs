@@ -38,6 +38,22 @@ impl OutputOpts {
     }
 }
 
+/// Split a thread budget between the reader and the writer.
+///
+/// Deflating costs several times more than inflating, so when the output is
+/// BGZF most of the budget goes to the writer; with plain output the writer
+/// needs none at all.
+pub fn split_threads(total: usize, bgzf_out: bool) -> (usize, usize) {
+    if total <= 1 {
+        return (1, 1);
+    }
+    if !bgzf_out {
+        return (total, 1);
+    }
+    let read = (total / 3).max(1);
+    (read, (total - read).max(1))
+}
+
 /// Resolve `--threads 0` to the machine's parallelism.
 pub fn resolve_threads(t: usize) -> usize {
     if t == 0 {

@@ -5,7 +5,7 @@ use std::io::Write;
 use crate::io::{detect_compression, open_raw_blocks, open_reader, Compression};
 use crate::vcf::header::{union_meta, Header};
 
-use super::{ignore_broken_pipe, resolve_threads, OutputOpts};
+use super::{ignore_broken_pipe, resolve_threads, split_threads, OutputOpts};
 
 #[derive(clap::Args, Debug)]
 pub struct ConcatArgs {
@@ -36,7 +36,7 @@ pub fn run(a: &ConcatArgs) -> Result<(), String> {
         return naive(&inputs, a, threads);
     }
 
-    let (rthreads, wthreads) = if threads <= 1 { (1, 1) } else { ((threads + 1) / 2, threads / 2) };
+    let (rthreads, wthreads) = split_threads(threads, a.out.bgzf()?);
     let mut w = a.out.writer(wthreads)?;
 
     // Read every header first so an incompatibility is reported before we

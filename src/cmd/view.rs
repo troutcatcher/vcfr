@@ -7,7 +7,7 @@ use crate::vcf::header::{select_samples, Header};
 use crate::vcf::record::*;
 use crate::vcf::RegionSet;
 
-use super::{ignore_broken_pipe, resolve_threads, OutputOpts};
+use super::{ignore_broken_pipe, resolve_threads, split_threads, OutputOpts};
 
 #[derive(clap::Args, Debug)]
 pub struct ViewArgs {
@@ -97,13 +97,7 @@ pub struct ViewArgs {
 
 pub fn run(a: &ViewArgs) -> Result<(), String> {
     let threads = resolve_threads(a.threads);
-    // Reading and writing each get their own workers; on a small box the
-    // reader wins the tie since inflation is usually the tighter bound.
-    let (rthreads, wthreads) = if threads <= 1 {
-        (1, 1)
-    } else {
-        ((threads + 1) / 2, threads / 2)
-    };
+    let (rthreads, wthreads) = split_threads(threads, a.out.bgzf()?);
 
     let mut rdr = open_reader(&a.input, rthreads).map_err(|e| e.to_string())?;
     let hdr = Header::read(&mut rdr).map_err(|e| e.to_string())?;

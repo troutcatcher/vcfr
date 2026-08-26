@@ -7,12 +7,12 @@ use crate::io::{open_reader, Reader};
 use crate::vcf::header::{union_meta, Header, Number};
 use crate::vcf::record::*;
 
-use super::{ignore_broken_pipe, resolve_threads, OutputOpts};
+use super::{ignore_broken_pipe, resolve_threads, split_threads, OutputOpts};
 
 #[derive(clap::Args, Debug)]
 pub struct MergeArgs {
     /// VCFs to merge; each must be coordinate-sorted
-    #[arg(value_name = "FILE", required = true)]
+    #[arg(value_name = "FILE")]
     pub inputs: Vec<String>,
 
     /// Read the file list from FILE, one path per line
@@ -38,7 +38,7 @@ pub struct MergeArgs {
 
     /// How to combine INFO fields present in several files:
     /// KEY:sum|avg|min|max|join|first,... Use "-" to always take the first value.
-    #[arg(long = "info-rules", default_value = "DP:sum,DP4:sum", value_name = "RULES")]
+    #[arg(short = 'i', long = "info-rules", default_value = "DP:sum,DP4:sum", value_name = "RULES")]
     pub info_rules: String,
 
     #[arg(long = "threads", default_value_t = 0, value_name = "N")]
@@ -272,10 +272,10 @@ pub fn run(a: &MergeArgs) -> Result<(), String> {
         return Err("merge needs at least two input files".into());
     }
     let threads = resolve_threads(a.threads);
-    // Every input is read concurrently, so split the reader budget between them
-    // and keep the rest for the writer.
-    let per_file = ((threads / 2) / inputs.len()).max(1);
-    let wthreads = if threads <= 1 { 1 } else { (threads / 2).max(1) };
+    // Every input is read concurrently, so the reader budget is shared between
+    // them and the rest goes to the writer.
+    let (rthreads, wthreads) = split_threads(threads, a.out.bgzf()?);
+    let per_file = (rthreads / inputs.len()).max(1);
 
     let mut headers = Vec::with_capacity(inputs.len());
     let mut readers = Vec::with_capacity(inputs.len());
@@ -317,7 +317,7 @@ pub fn run(a: &MergeArgs) -> Result<(), String> {
         merged_hdr.ensure_meta("INFO", "AC", "##INFO=<ID=AC,Number=A,Type=Integer,Description=\"Allele count in genotypes\">");
         merged_hdr.ensure_meta("INFO", "AN", "##INFO=<ID=AN,Number=1,Type=Integer,Description=\"Total number of alleles in called genotypes\">");
     }
-    merged_hdr.has_format_col = true;
+    merged_hdr.has_format_col = !out_samples.is_empty();
 
     let mut ranks = RankMap::new(&merged_hdr.contigs);
     let mut streams: Vec<Stream> = Vec::with_capacity(inputs.len());
@@ -674,14 +674,17 @@ fn emit(
     out.extend_from_slice(&ctx.info_buf);
 
     // --- FORMAT + samples --------------------------------------------------
-    out.push(b'\t');
-    for (i, k) in ctx.fmt_keys.iter().enumerate() {
-        if i > 0 {
-            out.push(b':');
+    // With no samples anywhere the record is sites-only and has no FORMAT.
+    if n_out > 0 {
+        out.push(b'\t');
+        for (i, k) in ctx.fmt_keys.iter().enumerate() {
+            if i > 0 {
+                out.push(b':');
+            }
+            out.extend_from_slice(k);
         }
-        out.extend_from_slice(k);
+        out.extend_from_slice(&ctx.samples_buf);
     }
-    out.extend_from_slice(&ctx.samples_buf);
     out.push(b'\n');
     Ok(())
 }
