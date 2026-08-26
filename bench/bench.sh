@@ -233,10 +233,13 @@ row "merge: 3 cohorts -> BGZF (1 thread)" \
 # the vcfr level that reproduces bcftools' output size, which is the honest
 # basis for the -O z rows above.
 echo
-echo "compression calibration (BGZF re-compress, $THREADS threads, 1 run):"
+echo "compression calibration (BGZF re-compress, $THREADS threads, best of $REPS):"
 printf '%-28s %10s %14s\n' "encoder" "time" "output bytes"
 printf '%-28s %10s %14s\n' "----------------------------" "----------" "--------------"
-one() { run_once "$1"; printf '%.2f' "$RUN_WALL"; }
+# Best-of-REPS like the rows above: a single run here lands right after the
+# previous encoder flushed hundreds of megabytes, and measures writeback rather
+# than compression.
+one() { best "$1"; printf '%.2f' "$BEST_WALL"; }
 d=$(one "bcftools view --threads $THREADS -O z -o $OUT/cal.gz $BIG")
 printf '%-28s %9ss %14s\n' "bcftools -Oz (zlib 6)" "$d" "$(stat -c %s "$OUT/cal.gz")"
 for L in 6 7 8; do
