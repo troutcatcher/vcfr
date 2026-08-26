@@ -2,9 +2,11 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::io::Write;
 
 use crate::io::{open_reader, Reader};
+use crate::pool::OrderedPool;
 use crate::vcf::header::{union_meta, Header, Number};
 use crate::vcf::record::*;
 
@@ -250,6 +252,59 @@ impl Stream {
     }
 }
 
+/// One record taking part in a merged site, carrying everything formatting
+/// needs and nothing that ties it to the stream it was read from. Keeping the
+/// two apart is what lets record assembly run off the main thread.
+struct Member<'a> {
+    line: &'a [u8],
+    rec: &'a Record,
+    /// Index of this file's first sample in the output sample list.
+    sample_off: usize,
+    n_samples: usize,
+}
+
+impl<'a> Member<'a> {
+    #[inline]
+    fn get(&self, col: usize) -> &'a [u8] {
+        self.rec.get(self.line, col)
+    }
+    #[inline]
+    fn ncols(&self) -> usize {
+        self.rec.ncols()
+    }
+}
+
+/// Sites per formatting job. Big enough to amortise the handoff, small enough
+/// that a few batches in flight stay cheap in memory.
+const GROUPS_PER_BATCH: usize = 128;
+
+/// Per-input constants a formatting worker needs.
+#[derive(Clone, Copy)]
+struct StreamInfo {
+    sample_off: usize,
+    n_samples: usize,
+}
+
+/// A run of merged sites handed to a worker to format.
+///
+/// The record lines are *moved* out of the input streams rather than copied:
+/// a stream is about to overwrite its buffer on the next advance anyway, so it
+/// takes a recycled one and hands this one over. The batch travels to the
+/// worker and the spent buffers come back for reuse.
+#[derive(Default)]
+struct Batch {
+    lines: Vec<Vec<u8>>,
+    owners: Vec<usize>,
+    /// Half-open ranges into `lines`; each becomes one output record.
+    groups: Vec<(u32, u32)>,
+}
+
+/// A formatted batch on its way back to the main thread.
+struct Formatted {
+    bytes: Vec<u8>,
+    spent: Vec<Vec<u8>>,
+}
+
 /// Reusable buffers so the per-record path does not allocate.
 #[derive(Default)]
 struct Ctx {
@@ -260,7 +315,6 @@ struct Ctx {
     fmt_keys: Vec<Vec<u8>>,
     /// Per member: union key index -> that member's subfield index.
     key_pos: Vec<Vec<Option<usize>>>,
-    gts: Vec<i32>,
     info_buf: Vec<u8>,
     ac: Vec<u64>,
 }
@@ -346,6 +400,25 @@ pub fn run(a: &MergeArgs) -> Result<(), String> {
 
     let rules = InfoRules::parse(&a.info_rules)?;
     let mode = MergeMode::parse(&a.merge)?;
+    let opts = EmitOpts { update: !a.no_update, missing_to_ref: a.missing_to_ref };
+
+    // Assembling merged records is the serial bottleneck whenever deflate is
+    // not. With BGZF output the writer already saturates the machine, so
+    // formatting stays on the main thread rather than competing with it.
+    let fmt_workers = if a.out.bgzf()? || threads <= 1 {
+        0
+    } else {
+        (threads / 2).max(1)
+    };
+    let infos = Arc::new(
+        streams.iter().map(|s| StreamInfo { sample_off: s.sample_off, n_samples: s.n_samples }).collect::<Vec<_>>(),
+    );
+    let shared = Arc::new(Shared { hdr: merged_hdr.clone(), rules: InfoRules::parse(&a.info_rules)? });
+    let mut pool: Option<OrderedPool<Result<Formatted, String>>> =
+        (fmt_workers > 0).then(|| OrderedPool::new(fmt_workers, fmt_workers * 3));
+    let mut batch = Batch::default();
+    let mut free: Vec<Vec<u8>> = Vec::new();
+    let mut groups: Vec<(Class, Vec<usize>)> = Vec::new();
     let mut ctx = Ctx::default();
     let n_out = out_samples.len();
     let mut members: Vec<usize> = Vec::with_capacity(streams.len());
@@ -372,65 +445,49 @@ pub fn run(a: &MergeArgs) -> Result<(), String> {
                     members.push(i);
                 }
             }
-            // Records that disagree on REF describe different events. Beyond
-            // that, -m decides which ALTs may share one multiallelic record;
-            // records whose alleles are already a subset of the group's join
-            // regardless, since that creates no new multiallelic.
-            let mut done = vec![false; members.len()];
-            let mut groups: Vec<(Class, Vec<usize>)> = Vec::new();
-            for gi in 0..members.len() {
-                if done[gi] {
-                    continue;
+            group_members(&streams, &members, mode, &mut groups);
+
+            if let Some(pool) = pool.as_mut() {
+                // Move each participating line into the batch and give the
+                // stream a recycled buffer to read its next record into.
+                for (_, g) in groups.iter() {
+                    let start = batch.lines.len() as u32;
+                    for &i in g {
+                        let fresh = free.pop().unwrap_or_default();
+                        batch.lines.push(std::mem::replace(&mut streams[i].line, fresh));
+                        batch.owners.push(i);
+                    }
+                    batch.groups.push((start, batch.lines.len() as u32));
                 }
-                done[gi] = true;
-                let head = members[gi];
-                let reference = streams[head].get(COL_REF).to_vec();
-                let mut alts: Vec<Vec<u8>> = alt_list(streams[head].get(COL_ALT))
-                    .into_iter()
-                    .map(|a| a.to_vec())
-                    .collect();
-                let mut class = classify(&reference, streams[head].get(COL_ALT));
-                let mut g = vec![head];
-                for gj in gi + 1..members.len() {
-                    if done[gj] {
-                        continue;
-                    }
-                    let s = &streams[members[gj]];
-                    if s.get(COL_REF) != &reference[..] {
-                        continue;
-                    }
-                    let their = alt_list(s.get(COL_ALT));
-                    let their_class = classify(&reference, s.get(COL_ALT));
-                    let novel = their.iter().filter(|a| !alts.iter().any(|x| x == *a)).count();
-                    // No new allele, or the mode says this class may combine.
-                    let ok = novel == 0
-                        || their.len() >= alts.len() + novel
-                        || mode.forces(class, their_class);
-                    if !ok {
-                        continue;
-                    }
-                    done[gj] = true;
-                    for a in their {
-                        if !alts.iter().any(|x| x == a) {
-                            alts.push(a.to_vec());
-                        }
-                    }
-                    if class == Class::Other {
-                        class = their_class;
-                    }
-                    g.push(members[gj]);
+                if batch.groups.len() >= GROUPS_PER_BATCH {
+                    submit_batch(pool, &mut batch, &infos, &shared, n_out, opts);
+                    drain_pool(pool, &mut w, &mut free, false)?;
                 }
-                groups.push((class, g));
-            }
-            groups.sort_by_key(|(c, _)| mode.rank(*c));
-            for (_, g) in &groups {
-                buf.clear();
-                emit(&streams, g, n_out, a, &merged_hdr, &rules, &mut ctx, &mut buf)?;
-                w.write_all(&buf).map_err(|e| e.to_string())?;
+            } else {
+                for (_, g) in groups.iter() {
+                    buf.clear();
+                    let mems: Vec<Member> = g
+                        .iter()
+                        .map(|&i| Member {
+                            line: &streams[i].line,
+                            rec: &streams[i].rec,
+                            sample_off: streams[i].sample_off,
+                            n_samples: streams[i].n_samples,
+                        })
+                        .collect();
+                    emit(&mems, n_out, opts, &merged_hdr, &rules, &mut ctx, &mut buf)?;
+                    w.write_all(&buf).map_err(|e| e.to_string())?;
+                }
             }
             for &i in &members {
                 streams[i].advance(&mut ranks)?;
             }
+        }
+        if let Some(pool) = pool.as_mut() {
+            if !batch.groups.is_empty() {
+                submit_batch(pool, &mut batch, &infos, &shared, n_out, opts);
+            }
+            drain_pool(pool, &mut w, &mut free, true)?;
         }
         Ok(())
     })();
@@ -439,28 +496,33 @@ pub fn run(a: &MergeArgs) -> Result<(), String> {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[derive(Clone, Copy)]
+struct EmitOpts {
+    update: bool,
+    missing_to_ref: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn emit(
-    streams: &[Stream],
-    members: &[usize],
+    members: &[Member],
     n_out: usize,
-    a: &MergeArgs,
+    opts: EmitOpts,
     hdr: &Header,
     rules: &InfoRules,
     ctx: &mut Ctx,
     out: &mut Vec<u8>,
 ) -> Result<(), String> {
-    let first = &streams[members[0]];
+    let first = &members[0];
 
     // Almost always every input describes the site identically. When it does,
     // there is nothing to renumber and no FORMAT union to take, so the whole
     // remapping apparatus below can be skipped and each input's sample columns
     // copied across in one memcpy.
     let first_alt = first.get(COL_ALT);
-    let first_fmt: &[u8] = if first.rec.ncols() > COL_FORMAT { first.get(COL_FORMAT) } else { b"" };
-    let uniform = members.iter().skip(1).all(|&m| {
-        let s = &streams[m];
-        s.get(COL_ALT) == first_alt
-            && (if s.rec.ncols() > COL_FORMAT { s.get(COL_FORMAT) } else { b"" }) == first_fmt
+    let first_fmt: &[u8] = if first.ncols() > COL_FORMAT { first.get(COL_FORMAT) } else { b"" };
+    let uniform = members.iter().skip(1).all(|m| {
+        m.get(COL_ALT) == first_alt
+            && (if m.ncols() > COL_FORMAT { m.get(COL_FORMAT) } else { b"" }) == first_fmt
     });
 
     let n_alt;
@@ -476,9 +538,8 @@ fn emit(
         // --- ALT union and per-member allele renumbering ---------------------
         ctx.alts.clear();
         ctx.maps.clear();
-        for &m in members {
-            let s = &streams[m];
-            let alt = s.get(COL_ALT);
+        for m in members {
+            let alt = m.get(COL_ALT);
             let mut map = vec![0i32; 1];
             let mut ident = true;
             if alt != b"." && !alt.is_empty() {
@@ -508,12 +569,11 @@ fn emit(
         // --- FORMAT union ----------------------------------------------------
         ctx.fmt_keys.clear();
         let mut has_gt = false;
-        for &m in members {
-            let s = &streams[m];
-            if s.rec.ncols() <= COL_FORMAT {
+        for m in members {
+            if m.ncols() <= COL_FORMAT {
                 continue;
             }
-            for k in s.get(COL_FORMAT).split(|&b| b == b':') {
+            for k in m.get(COL_FORMAT).split(|&b| b == b':') {
                 if k == b"GT" {
                     has_gt = true;
                     continue;
@@ -527,10 +587,9 @@ fn emit(
             ctx.fmt_keys.insert(0, b"GT".to_vec());
         }
         ctx.key_pos.clear();
-        for &m in members {
-            let s = &streams[m];
-            let own: Vec<&[u8]> = if s.rec.ncols() > COL_FORMAT {
-                s.get(COL_FORMAT).split(|&b| b == b':').collect()
+        for m in members {
+            let own: Vec<&[u8]> = if m.ncols() > COL_FORMAT {
+                m.get(COL_FORMAT).split(|&b| b == b':').collect()
             } else {
                 Vec::new()
             };
@@ -549,23 +608,22 @@ fn emit(
     ctx.ac.clear();
     ctx.ac.resize(n_alt, 0);
     let mut an = 0u64;
-    let update = !a.no_update;
+    let update = opts.update;
     let mut ploidy = 0usize;
 
     // Determine the ploidy used to pad samples that are absent from a file.
     if let Some(slot) = gt_slot {
-        'outer: for (mi, &m) in members.iter().enumerate() {
-            let s = &streams[m];
-            if s.rec.ncols() <= FIRST_SAMPLE {
+        'outer: for (mi, m) in members.iter().enumerate() {
+            if m.ncols() <= FIRST_SAMPLE {
                 continue;
             }
             if let Some(si) = if uniform { Some(slot) } else { ctx.key_pos[mi][slot] } {
-                for j in 0..s.n_samples {
+                for j in 0..m.n_samples {
                     let col = FIRST_SAMPLE + j;
-                    if col >= s.rec.ncols() {
+                    if col >= m.ncols() {
                         break;
                     }
-                    let g = subfield(s.get(col), si);
+                    let g = subfield(m.get(col), si);
                     let p = g.iter().filter(|&&b| b == b'/' || b == b'|').count() + 1;
                     if p > 0 && g != b"." {
                         ploidy = p;
@@ -584,37 +642,23 @@ fn emit(
     // genotype columns go straight into the output buffer below, instead of
     // being staged in a second buffer and copied again.
     if update {
-        for (mi, &m) in members.iter().enumerate() {
-            let s = &streams[m];
+        for (mi, m) in members.iter().enumerate() {
             let si = match gt_slot.and_then(|slot| if uniform { Some(slot) } else { ctx.key_pos[mi][slot] }) {
                 Some(si) => si,
                 None => continue,
             };
-            for j in 0..s.n_samples {
-                let col = FIRST_SAMPLE + j;
-                if col >= s.rec.ncols() {
-                    break;
-                }
-                parse_gt(subfield(s.get(col), si), &mut ctx.gts);
-                for &al in ctx.gts.iter() {
-                    if al < 0 {
-                        continue;
-                    }
-                    an += 1;
-                    let mapped = if ctx.identity[mi] {
-                        al
-                    } else {
-                        ctx.maps[mi].get(al as usize).copied().unwrap_or(-1)
-                    };
-                    if mapped > 0 && (mapped as usize) <= n_alt {
-                        ctx.ac[mapped as usize - 1] += 1;
-                    }
-                }
+            // Hoist the renumbering decision out of the per-sample loop.
+            let map: Option<&[i32]> = if ctx.identity[mi] { None } else { Some(&ctx.maps[mi]) };
+            let last = m.ncols().min(FIRST_SAMPLE + m.n_samples);
+            for col in FIRST_SAMPLE..last {
+                let field = m.get(col);
+                let gt = if si == 0 { field } else { subfield(field, si) };
+                count_gt(gt, map, n_alt, &mut ctx.ac, &mut an);
             }
         }
-        if a.missing_to_ref {
+        if opts.missing_to_ref {
             // Samples no input covers are called 0/0, so they contribute alleles.
-            let covered: usize = members.iter().map(|&m| streams[m].n_samples).sum();
+            let covered: usize = members.iter().map(|m| m.n_samples).sum();
             an += (n_out.saturating_sub(covered) * ploidy) as u64;
         }
     }
@@ -624,7 +668,7 @@ fn emit(
     out.push(b'\t');
     out.extend_from_slice(first.get(COL_POS));
     out.push(b'\t');
-    write_ids(out, streams, members);
+    write_ids(out, members);
     out.push(b'\t');
     out.extend_from_slice(first.get(COL_REF));
     out.push(b'\t');
@@ -641,9 +685,9 @@ fn emit(
         }
     }
     out.push(b'\t');
-    write_qual(out, streams, members);
+    write_qual(out, members);
     out.push(b'\t');
-    write_filter(out, streams, members);
+    write_filter(out, members);
     out.push(b'\t');
 
     // --- INFO -------------------------------------------------------------
@@ -652,7 +696,6 @@ fn emit(
     let skip: &[&[u8]] = if update { &[b"AC", b"AN"] } else { &[] };
     merge_info(
         &mut ctx.info_buf,
-        streams,
         members,
         &ctx.maps,
         &ctx.identity,
@@ -690,24 +733,23 @@ fn emit(
         }
 
         let mut next_out_sample = 0usize;
-        for (mi, &m) in members.iter().enumerate() {
-            let s = &streams[m];
-            while next_out_sample < s.sample_off {
-                push_missing(out, n_keys, gt_slot, ploidy, a.missing_to_ref);
+        for (mi, m) in members.iter().enumerate() {
+            while next_out_sample < m.sample_off {
+                push_missing(out, n_keys, gt_slot, ploidy, opts.missing_to_ref);
                 next_out_sample += 1;
             }
             let passthrough = ctx.identity[mi]
-                && s.rec.ncols() > COL_FORMAT
-                && (uniform || format_matches(s.get(COL_FORMAT), &ctx.fmt_keys));
-            if passthrough && s.rec.ncols() == FIRST_SAMPLE + s.n_samples && s.n_samples > 0 {
+                && m.ncols() > COL_FORMAT
+                && (uniform || format_matches(m.get(COL_FORMAT), &ctx.fmt_keys));
+            if passthrough && m.ncols() == FIRST_SAMPLE + m.n_samples && m.n_samples > 0 {
                 // Every sample column is reproduced verbatim, so copy the whole
                 // run of them, tab separators included, in one memcpy.
                 out.push(b'\t');
-                out.extend_from_slice(s.rec.span(&s.line, FIRST_SAMPLE, s.rec.ncols() - 1));
+                out.extend_from_slice(m.rec.span(m.line, FIRST_SAMPLE, m.ncols() - 1));
             } else {
-                for j in 0..s.n_samples {
+                for j in 0..m.n_samples {
                     let col = FIRST_SAMPLE + j;
-                    let field: &[u8] = if col < s.rec.ncols() { s.get(col) } else { b"." };
+                    let field: &[u8] = if col < m.ncols() { m.get(col) } else { b"." };
                     out.push(b'\t');
                     if passthrough {
                         out.extend_from_slice(field);
@@ -726,14 +768,142 @@ fn emit(
                     }
                 }
             }
-            next_out_sample += s.n_samples;
+            next_out_sample += m.n_samples;
         }
         while next_out_sample < n_out {
-            push_missing(out, n_keys, gt_slot, ploidy, a.missing_to_ref);
+            push_missing(out, n_keys, gt_slot, ploidy, opts.missing_to_ref);
             next_out_sample += 1;
         }
     }
     out.push(b'\n');
+    Ok(())
+}
+
+/// Partition the records at one position into output records.
+///
+/// Records that disagree on REF describe different events. Beyond that, -m
+/// decides which ALTs may share one multiallelic record; records whose alleles
+/// are already a subset of the group's join regardless, since that creates no
+/// new multiallelic.
+fn group_members(
+    streams: &[Stream],
+    members: &[usize],
+    mode: MergeMode,
+    out: &mut Vec<(Class, Vec<usize>)>,
+) {
+    out.clear();
+    let mut done = vec![false; members.len()];
+    for gi in 0..members.len() {
+        if done[gi] {
+            continue;
+        }
+        done[gi] = true;
+        let head = members[gi];
+        let reference = streams[head].get(COL_REF).to_vec();
+        let mut alts: Vec<Vec<u8>> = alt_list(streams[head].get(COL_ALT))
+            .into_iter()
+            .map(|a| a.to_vec())
+            .collect();
+        let mut class = classify(&reference, streams[head].get(COL_ALT));
+        let mut g = vec![head];
+        for gj in gi + 1..members.len() {
+            if done[gj] {
+                continue;
+            }
+            let s = &streams[members[gj]];
+            if s.get(COL_REF) != &reference[..] {
+                continue;
+            }
+            let their = alt_list(s.get(COL_ALT));
+            let their_class = classify(&reference, s.get(COL_ALT));
+            let novel = their.iter().filter(|a| !alts.iter().any(|x| x == *a)).count();
+            let ok = novel == 0
+                || their.len() >= alts.len() + novel
+                || mode.forces(class, their_class);
+            if !ok {
+                continue;
+            }
+            done[gj] = true;
+            for a in their {
+                if !alts.iter().any(|x| x == a) {
+                    alts.push(a.to_vec());
+                }
+            }
+            if class == Class::Other {
+                class = their_class;
+            }
+            g.push(members[gj]);
+        }
+        out.push((class, g));
+    }
+    out.sort_by_key(|(c, _)| mode.rank(*c));
+}
+
+/// Everything a formatting worker shares across batches.
+struct Shared {
+    hdr: Header,
+    rules: InfoRules,
+}
+
+/// Hand a batch to the pool. The lines travel with it; splitting them into
+/// columns and assembling the records happens on the worker.
+fn submit_batch(
+    pool: &mut OrderedPool<Result<Formatted, String>>,
+    batch: &mut Batch,
+    infos: &Arc<Vec<StreamInfo>>,
+    shared: &Arc<Shared>,
+    n_out: usize,
+    opts: EmitOpts,
+) {
+    let job = std::mem::take(batch);
+    let infos = Arc::clone(infos);
+    let shared = Arc::clone(shared);
+    pool.submit(move || {
+        let mut ctx = Ctx::default();
+        let mut recs: Vec<Record> = Vec::with_capacity(job.lines.len());
+        for line in &job.lines {
+            let mut r = Record::new();
+            r.split(line);
+            recs.push(r);
+        }
+        let mut bytes = Vec::with_capacity(64 << 10);
+        let mut mems: Vec<Member> = Vec::with_capacity(4);
+        for &(start, end) in &job.groups {
+            mems.clear();
+            for k in start as usize..end as usize {
+                let info = infos[job.owners[k]];
+                mems.push(Member {
+                    line: &job.lines[k],
+                    rec: &recs[k],
+                    sample_off: info.sample_off,
+                    n_samples: info.n_samples,
+                });
+            }
+            emit(&mems, n_out, opts, &shared.hdr, &shared.rules, &mut ctx, &mut bytes)?;
+        }
+        drop(mems);
+        drop(recs);
+        Ok(Formatted { bytes, spent: job.lines })
+    });
+}
+
+/// Write finished batches in order and reclaim their buffers.
+fn drain_pool(
+    pool: &mut OrderedPool<Result<Formatted, String>>,
+    w: &mut crate::io::Writer,
+    free: &mut Vec<Vec<u8>>,
+    until_empty: bool,
+) -> Result<(), String> {
+    while pool.outstanding() >= pool.capacity() || (until_empty && pool.outstanding() > 0) {
+        match pool.next() {
+            Some(Ok(mut f)) => {
+                w.write_all(&f.bytes).map_err(|e| e.to_string())?;
+                free.append(&mut f.spent);
+            }
+            Some(Err(e)) => return Err(e),
+            None => break,
+        }
+    }
     Ok(())
 }
 
@@ -884,11 +1054,11 @@ fn remap_values(v: &[u8], map: &[i32], n_new: usize, offset: usize, out: &mut Ve
     }
 }
 
-fn write_ids(out: &mut Vec<u8>, streams: &[Stream], members: &[usize]) {
+fn write_ids(out: &mut Vec<u8>, members: &[Member]) {
     let mut any = false;
     let mut seen: Vec<&[u8]> = Vec::new();
-    for &m in members {
-        let id = streams[m].get(COL_ID);
+    for m in members {
+        let id = m.get(COL_ID);
         if id == b"." || id.is_empty() {
             continue;
         }
@@ -909,10 +1079,10 @@ fn write_ids(out: &mut Vec<u8>, streams: &[Stream], members: &[usize]) {
     }
 }
 
-fn write_qual(out: &mut Vec<u8>, streams: &[Stream], members: &[usize]) {
+fn write_qual(out: &mut Vec<u8>, members: &[Member]) {
     let mut best: Option<(f64, &[u8])> = None;
-    for &m in members {
-        let q = streams[m].get(COL_QUAL);
+    for m in members {
+        let q = m.get(COL_QUAL);
         if let Some(v) = std::str::from_utf8(q).ok().and_then(|s| s.parse::<f64>().ok()) {
             if best.map_or(true, |(b, _)| v > b) {
                 best = Some((v, q));
@@ -925,11 +1095,11 @@ fn write_qual(out: &mut Vec<u8>, streams: &[Stream], members: &[usize]) {
     }
 }
 
-fn write_filter(out: &mut Vec<u8>, streams: &[Stream], members: &[usize]) {
+fn write_filter(out: &mut Vec<u8>, members: &[Member]) {
     let mut seen: Vec<&[u8]> = Vec::new();
     let mut saw_pass = false;
-    for &m in members {
-        for f in streams[m].get(COL_FILTER).split(|&b| b == b';') {
+    for m in members {
+        for f in m.get(COL_FILTER).split(|&b| b == b';') {
             if f == b"PASS" {
                 saw_pass = true;
             } else if f != b"." && !f.is_empty() && !seen.contains(&f) {
@@ -972,8 +1142,7 @@ struct InfoEntry<'a> {
 #[allow(clippy::too_many_arguments)]
 fn merge_info<'a>(
     out: &mut Vec<u8>,
-    streams: &'a [Stream],
-    members: &[usize],
+    members: &[Member<'a>],
     maps: &[Vec<i32>],
     identity: &[bool],
     n_alt: usize,
@@ -982,8 +1151,8 @@ fn merge_info<'a>(
     skip: &[&[u8]],
 ) {
     let mut entries: Vec<InfoEntry<'a>> = Vec::new();
-    for (mi, &m) in members.iter().enumerate() {
-        let info = streams[m].get(COL_INFO);
+    for (mi, m) in members.iter().enumerate() {
+        let info = m.get(COL_INFO);
         if info == b"." || info.is_empty() {
             continue;
         }

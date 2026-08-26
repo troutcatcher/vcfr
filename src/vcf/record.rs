@@ -225,6 +225,53 @@ pub fn parse_gt(gt: &[u8], out: &mut Vec<i32>) -> bool {
     phased
 }
 
+/// Accumulate allele counts straight from a sample column.
+///
+/// This runs once per sample per site — 125 million times over a three-way
+/// merge of 250k sites — so it reads the GT subfield in place: it stops at the
+/// first `:` rather than slicing the subfield out first, and it never
+/// materialises the allele list.
+///
+/// `map` renumbers alleles when the record's ALTs were merged into a longer
+/// list; `None` means the numbering already matches.
+#[inline]
+pub fn count_gt(field: &[u8], map: Option<&[i32]>, n_alt: usize, ac: &mut [u64], an: &mut u64) {
+    let mut i = 0;
+    while i < field.len() {
+        let b = field[i];
+        if b == b':' {
+            return;
+        }
+        if b.is_ascii_digit() {
+            let mut v = (b - b'0') as usize;
+            i += 1;
+            while i < field.len() {
+                let c = field[i];
+                if !c.is_ascii_digit() {
+                    break;
+                }
+                v = v * 10 + (c - b'0') as usize;
+                i += 1;
+            }
+            // A called allele counts towards AN whether or not it survives the
+            // renumbering.
+            *an += 1;
+            let a = match map {
+                None => v,
+                Some(m) => match m.get(v) {
+                    Some(&x) if x > 0 => x as usize,
+                    _ => continue,
+                },
+            };
+            if a > 0 && a <= n_alt {
+                ac[a - 1] += 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
+}
+
 /// Allele counts over the selected sample columns.
 pub struct AlleleCounts {
     pub ac: Vec<u64>,
