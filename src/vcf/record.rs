@@ -235,7 +235,42 @@ pub fn parse_gt(gt: &[u8], out: &mut Vec<i32>) -> bool {
 /// `map` renumbers alleles when the record's ALTs were merged into a longer
 /// list; `None` means the numbering already matches.
 #[inline]
+fn count_allele(v: usize, map: Option<&[i32]>, n_alt: usize, ac: &mut [u64], an: &mut u64) {
+    // A called allele counts towards AN whether or not it survives renumbering.
+    *an += 1;
+    let a = match map {
+        None => v,
+        Some(m) => match m.get(v) {
+            Some(&x) if x > 0 => x as usize,
+            _ => return,
+        },
+    };
+    if a > 0 && a <= n_alt {
+        ac[a - 1] += 1;
+    }
+}
+
+#[inline]
 pub fn count_gt(field: &[u8], map: Option<&[i32]>, n_alt: usize, ac: &mut [u64], an: &mut u64) {
+    // Nearly every genotype in real data is one of "0/0", "0/1", "1|1", "./."
+    // — two single-digit-or-missing alleles and one separator. Recognising that
+    // shape costs a handful of comparisons instead of a byte-at-a-time scan.
+    if field.len() >= 3
+        && (field[1] == b'/' || field[1] == b'|')
+        && (field.len() == 3 || field[3] == b':')
+    {
+        let (x, y) = (field[0], field[2]);
+        let (xd, yd) = (x.is_ascii_digit(), y.is_ascii_digit());
+        if (xd || x == b'.') && (yd || y == b'.') {
+            if xd {
+                count_allele((x - b'0') as usize, map, n_alt, ac, an);
+            }
+            if yd {
+                count_allele((y - b'0') as usize, map, n_alt, ac, an);
+            }
+            return;
+        }
+    }
     let mut i = 0;
     while i < field.len() {
         let b = field[i];
@@ -253,19 +288,7 @@ pub fn count_gt(field: &[u8], map: Option<&[i32]>, n_alt: usize, ac: &mut [u64],
                 v = v * 10 + (c - b'0') as usize;
                 i += 1;
             }
-            // A called allele counts towards AN whether or not it survives the
-            // renumbering.
-            *an += 1;
-            let a = match map {
-                None => v,
-                Some(m) => match m.get(v) {
-                    Some(&x) if x > 0 => x as usize,
-                    _ => continue,
-                },
-            };
-            if a > 0 && a <= n_alt {
-                ac[a - 1] += 1;
-            }
+            count_allele(v, map, n_alt, ac, an);
         } else {
             i += 1;
         }

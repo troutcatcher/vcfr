@@ -229,7 +229,11 @@ impl Stream {
             }
             self.line.clear();
             self.line.extend_from_slice(l);
-            self.rec.split(&self.line);
+            // The main thread only orders and groups records, which needs
+            // nothing past FORMAT. Splitting the sample columns is left to
+            // whoever formats the record, so this scans a few dozen bytes
+            // instead of the whole line.
+            self.rec.split_prefix(&self.line, COL_FORMAT + 1);
             if self.rec.ncols() < 8 {
                 continue;
             }
@@ -274,9 +278,12 @@ impl<'a> Member<'a> {
     }
 }
 
-/// Sites per formatting job. Big enough to amortise the handoff, small enough
-/// that a few batches in flight stay cheap in memory.
-const GROUPS_PER_BATCH: usize = 128;
+/// Input bytes per formatting job.
+///
+/// Batching by bytes rather than by site keeps memory predictable: a fixed
+/// number of sites per batch would scale the working set with the sample
+/// count, so a wide cohort would quietly use far more memory than a narrow one.
+const BATCH_BYTES: usize = 2 << 20;
 
 /// Per-input constants a formatting worker needs.
 #[derive(Clone, Copy)]
@@ -297,12 +304,31 @@ struct Batch {
     owners: Vec<usize>,
     /// Half-open ranges into `lines`; each becomes one output record.
     groups: Vec<(u32, u32)>,
+    /// Recycled output buffer this batch will be formatted into.
+    out: Vec<u8>,
+    /// Total length of `lines`, used to decide when to hand the batch off.
+    bytes: usize,
 }
 
 /// A formatted batch on its way back to the main thread.
 struct Formatted {
     bytes: Vec<u8>,
     spent: Vec<Vec<u8>>,
+}
+
+/// Per-worker scratch, kept alive between batches.
+///
+/// Without this a worker reallocates its column splits and every reusable
+/// buffer in `Ctx` once per batch, which for a few thousand batches is a few
+/// hundred thousand allocations that buy nothing.
+#[derive(Default)]
+struct Scratch {
+    ctx: Ctx,
+    recs: Vec<Record>,
+}
+
+thread_local! {
+    static SCRATCH: std::cell::RefCell<Scratch> = std::cell::RefCell::new(Scratch::default());
 }
 
 /// Reusable buffers so the per-record path does not allocate.
@@ -415,10 +441,13 @@ pub fn run(a: &MergeArgs) -> Result<(), String> {
     );
     let shared = Arc::new(Shared { hdr: merged_hdr.clone(), rules: InfoRules::parse(&a.info_rules)? });
     let mut pool: Option<OrderedPool<Result<Formatted, String>>> =
-        (fmt_workers > 0).then(|| OrderedPool::new(fmt_workers, fmt_workers * 3));
+        (fmt_workers > 0).then(|| OrderedPool::new(fmt_workers, fmt_workers * 2));
     let mut batch = Batch::default();
     let mut free: Vec<Vec<u8>> = Vec::new();
+    let mut free_out: Vec<Vec<u8>> = Vec::new();
     let mut groups: Vec<(Class, Vec<usize>)> = Vec::new();
+    // Full column splits for the inline path, reused across records.
+    let mut full: Vec<Record> = Vec::new();
     let mut ctx = Ctx::default();
     let n_out = out_samples.len();
     let mut members: Vec<usize> = Vec::with_capacity(streams.len());
@@ -454,23 +483,32 @@ pub fn run(a: &MergeArgs) -> Result<(), String> {
                     let start = batch.lines.len() as u32;
                     for &i in g {
                         let fresh = free.pop().unwrap_or_default();
-                        batch.lines.push(std::mem::replace(&mut streams[i].line, fresh));
+                        let line = std::mem::replace(&mut streams[i].line, fresh);
+                        batch.bytes += line.len();
+                        batch.lines.push(line);
                         batch.owners.push(i);
                     }
                     batch.groups.push((start, batch.lines.len() as u32));
                 }
-                if batch.groups.len() >= GROUPS_PER_BATCH {
-                    submit_batch(pool, &mut batch, &infos, &shared, n_out, opts);
-                    drain_pool(pool, &mut w, &mut free, false)?;
+                if batch.bytes >= BATCH_BYTES {
+                    submit_batch(pool, &mut batch, &infos, &shared, n_out, opts, &mut free_out);
+                    drain_pool(pool, &mut w, &mut free, &mut free_out, false)?;
                 }
             } else {
                 for (_, g) in groups.iter() {
                     buf.clear();
+                    while full.len() < g.len() {
+                        full.push(Record::new());
+                    }
+                    for (k, &i) in g.iter().enumerate() {
+                        full[k].split(&streams[i].line);
+                    }
                     let mems: Vec<Member> = g
                         .iter()
-                        .map(|&i| Member {
+                        .enumerate()
+                        .map(|(k, &i)| Member {
                             line: &streams[i].line,
-                            rec: &streams[i].rec,
+                            rec: &full[k],
                             sample_off: streams[i].sample_off,
                             n_samples: streams[i].n_samples,
                         })
@@ -485,9 +523,9 @@ pub fn run(a: &MergeArgs) -> Result<(), String> {
         }
         if let Some(pool) = pool.as_mut() {
             if !batch.groups.is_empty() {
-                submit_batch(pool, &mut batch, &infos, &shared, n_out, opts);
+                submit_batch(pool, &mut batch, &infos, &shared, n_out, opts, &mut free_out);
             }
-            drain_pool(pool, &mut w, &mut free, true)?;
+            drain_pool(pool, &mut w, &mut free, &mut free_out, true)?;
         }
         Ok(())
     })();
@@ -854,36 +892,41 @@ fn submit_batch(
     shared: &Arc<Shared>,
     n_out: usize,
     opts: EmitOpts,
+    free_out: &mut Vec<Vec<u8>>,
 ) {
+    batch.out = free_out.pop().unwrap_or_else(|| Vec::with_capacity(1 << 20));
     let job = std::mem::take(batch);
     let infos = Arc::clone(infos);
     let shared = Arc::clone(shared);
     pool.submit(move || {
-        let mut ctx = Ctx::default();
-        let mut recs: Vec<Record> = Vec::with_capacity(job.lines.len());
-        for line in &job.lines {
-            let mut r = Record::new();
-            r.split(line);
-            recs.push(r);
-        }
-        let mut bytes = Vec::with_capacity(64 << 10);
-        let mut mems: Vec<Member> = Vec::with_capacity(4);
-        for &(start, end) in &job.groups {
-            mems.clear();
-            for k in start as usize..end as usize {
-                let info = infos[job.owners[k]];
-                mems.push(Member {
-                    line: &job.lines[k],
-                    rec: &recs[k],
-                    sample_off: info.sample_off,
-                    n_samples: info.n_samples,
-                });
+        SCRATCH.with(|cell| {
+            let mut scratch = cell.borrow_mut();
+            let Scratch { ctx, recs } = &mut *scratch;
+            while recs.len() < job.lines.len() {
+                recs.push(Record::new());
             }
-            emit(&mems, n_out, opts, &shared.hdr, &shared.rules, &mut ctx, &mut bytes)?;
-        }
-        drop(mems);
-        drop(recs);
-        Ok(Formatted { bytes, spent: job.lines })
+            for (k, line) in job.lines.iter().enumerate() {
+                recs[k].split(line);
+            }
+            let mut bytes = job.out;
+            bytes.clear();
+            let mut mems: Vec<Member> = Vec::with_capacity(4);
+            for &(start, end) in &job.groups {
+                mems.clear();
+                for k in start as usize..end as usize {
+                    let info = infos[job.owners[k]];
+                    mems.push(Member {
+                        line: &job.lines[k],
+                        rec: &recs[k],
+                        sample_off: info.sample_off,
+                        n_samples: info.n_samples,
+                    });
+                }
+                emit(&mems, n_out, opts, &shared.hdr, &shared.rules, ctx, &mut bytes)?;
+            }
+            drop(mems);
+            Ok(Formatted { bytes, spent: job.lines })
+        })
     });
 }
 
@@ -892,6 +935,7 @@ fn drain_pool(
     pool: &mut OrderedPool<Result<Formatted, String>>,
     w: &mut crate::io::Writer,
     free: &mut Vec<Vec<u8>>,
+    free_out: &mut Vec<Vec<u8>>,
     until_empty: bool,
 ) -> Result<(), String> {
     while pool.outstanding() >= pool.capacity() || (until_empty && pool.outstanding() > 0) {
@@ -899,6 +943,7 @@ fn drain_pool(
             Some(Ok(mut f)) => {
                 w.write_all(&f.bytes).map_err(|e| e.to_string())?;
                 free.append(&mut f.spent);
+                free_out.push(f.bytes);
             }
             Some(Err(e)) => return Err(e),
             None => break,
