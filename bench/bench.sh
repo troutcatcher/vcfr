@@ -38,9 +38,12 @@ if [[ ! -f $BIG ]]; then
   rm -f "$DATA/big.vcf"
   bcftools index -f "$BIG"
 fi
+# Split with vcfr, not bcftools: bcftools stamps the region it was given into
+# a ##bcftools_viewCommand header line, so the parts would not share a header
+# and `concat --naive` (which requires identical headers) could not run at all.
 for i in 1 2 3 4; do
   P=$DATA/part$i.$SITES.$SAMPLES.vcf.gz
-  [[ -f $P ]] || { bcftools view -r "chr$i" -O z -o "$P" "$BIG"; bcftools index -f "$P"; }
+  [[ -f $P ]] || { $VCFR view --threads "$THREADS" -r "chr$i" -O z -o "$P" "$BIG"; bcftools index -f "$P"; }
 done
 COHORTS=()
 for i in 1 2 3; do
@@ -65,7 +68,15 @@ best() { # best <command string> -> seconds
   local b=999999 t
   for _ in $(seq "$REPS"); do
     local s=$(date +%s.%N)
-    eval "$1" >/dev/null 2>&1
+    # A benchmark that times a failing command is worse than no benchmark:
+    # refuse to report a number for a command that did not succeed.
+    if ! eval "$1" >/dev/null 2>"$OUT/cmd.err"; then
+      echo >&2
+      echo "benchmark aborted: command failed" >&2
+      echo "  $1" >&2
+      sed 's/^/  /' "$OUT/cmd.err" >&2
+      exit 1
+    fi
     local e=$(date +%s.%N)
     t=$(echo "$e - $s" | bc)
     b=$(echo "if ($t < $b) $t else $b" | bc)
@@ -73,14 +84,25 @@ best() { # best <command string> -> seconds
   printf '%.2f' "$b"
 }
 
-printf '%-40s %10s %10s %9s\n' "operation" "bcftools" "vcfr" "speedup"
-printf '%-40s %10s %10s %9s\n' "----------------------------------------" "----------" "----------" "---------"
-row() { # row <label> <bcftools cmd> <vcfr cmd>
-  local bt vt
+hdr() {
+  printf '%-40s %10s %10s %9s  %s\n' "$1" "$2" "$3" "$4" "$5"
+}
+hdr "operation" "bcftools" "vcfr" "speedup" "output size (bcftools / vcfr)"
+hdr "----------------------------------------" "----------" "----------" "---------" "----------------------------"
+
+# row <label> <bcftools cmd> <vcfr cmd>
+#
+# When both commands wrote $OUT/b.vcf.gz and $OUT/v.vcf.gz the sizes are
+# reported too: a BGZF speedup means nothing without knowing how hard each
+# tool compressed.
+row() {
+  local bt vt sizes=""
+  rm -f "$OUT/b.vcf.gz" "$OUT/v.vcf.gz"
   bt=$(best "$2"); vt=$(best "$3")
-  local sp
-  sp=$(echo "scale=2; $bt / $vt" | bc)
-  printf '%-40s %9ss %9ss %8sx\n' "$1" "$bt" "$vt" "$sp"
+  if [[ -s $OUT/b.vcf.gz && -s $OUT/v.vcf.gz ]]; then
+    sizes="$(du -h "$OUT/b.vcf.gz" | cut -f1) / $(du -h "$OUT/v.vcf.gz" | cut -f1)"
+  fi
+  printf '%-40s %9ss %9ss %8sx  %s\n' "$1" "$bt" "$vt" "$(echo "scale=2; $bt / $vt" | bc)" "$sizes"
 }
 
 row "view: decompress to VCF" \
@@ -143,3 +165,21 @@ row "view: BGZF -> BGZF (1 thread)" \
 row "merge: 3 cohorts -> BGZF (1 thread)" \
     "bcftools merge -O z -o $OUT/b.vcf.gz ${COHORTS[*]}" \
     "$VCFR merge --threads 1 -O z -o $OUT/v.vcf.gz ${COHORTS[*]}"
+
+# ------------------------------------------------ compression calibration --
+# vcfr deflates with libdeflate, bcftools with zlib, and the two disagree about
+# what a given level means: libdeflate's 6 is faster but weaker. Comparing both
+# at "level 6" therefore compares different amounts of work. This sweep finds
+# the vcfr level that reproduces bcftools' output size, which is the honest
+# basis for the -O z rows above.
+echo
+echo "compression calibration (BGZF re-compress, $THREADS threads, 1 run):"
+printf '%-28s %10s %14s\n' "encoder" "time" "output bytes"
+printf '%-28s %10s %14s\n' "----------------------------" "----------" "--------------"
+one() { local s e; s=$(date +%s.%N); eval "$1" >/dev/null 2>&1; e=$(date +%s.%N); printf '%.2f' "$(echo "$e - $s" | bc)"; }
+d=$(one "bcftools view --threads $THREADS -O z -o $OUT/cal.gz $BIG")
+printf '%-28s %9ss %14s\n' "bcftools -Oz (zlib 6)" "$d" "$(stat -c %s "$OUT/cal.gz")"
+for L in 6 7 8; do
+  d=$(one "$VCFR view --threads $THREADS -O z -l $L -o $OUT/cal.gz $BIG")
+  printf '%-28s %9ss %14s\n' "vcfr -Oz -l $L" "$d" "$(stat -c %s "$OUT/cal.gz")"
+done
