@@ -36,18 +36,24 @@ fn main() {
     // Train on a mid-file block: the first blocks are the VCF header.
     let train_block = blocks[blocks.len() / 2];
     let codes = deflate::CodeSet::train(train_block, &mut m);
-    let t = Instant::now();
-    let mut total = 0usize;
     let mut out = Vec::with_capacity(0xff00 + 1024);
-    for b in &blocks {
-        out.clear();
-        deflate::compress_into(&codes, &mut m, b, &mut out);
-        total += out.len();
+    // Several in-process passes: cross-run noise on this host is bigger than
+    // the effects being measured, and the fastest pass is the least disturbed.
+    let mut best = f64::MAX;
+    let mut total = 0usize;
+    for _ in 0..4 {
+        let t = Instant::now();
+        total = 0;
+        for b in &blocks {
+            out.clear();
+            deflate::compress_into(&codes, &mut m, b, &mut out);
+            total += out.len();
+        }
+        best = best.min(t.elapsed().as_secs_f64());
     }
-    let dt = t.elapsed().as_secs_f64();
     println!(
-        "vcfr-rs      : {:>7.1} MB/s   ratio {:.3}   {} bytes",
-        mb / dt,
+        "vcfr-rs      : {:>7.1} MB/s (best of 4)   ratio {:.3}   {} bytes",
+        mb / best,
         data.len() as f64 / total as f64,
         total
     );

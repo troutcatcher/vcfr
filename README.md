@@ -365,6 +365,17 @@ BGZF; BCF is not supported.
 cargo build --release      # target/release/vcfr
 ```
 
+For a few percent more, build with profile-guided optimisation:
+
+```sh
+rustup component add llvm-tools
+scripts/build-pgo.sh       # target/pgo/release/vcfr
+```
+
+Measured interleaved against the plain build: ~7% on `-l 0` end-to-end and
+~5% on the encoder itself, with byte-identical output; the libdeflate levels
+gain only 1-3% because the C library is not instrumented.
+
 Dependencies: `libdeflater` (the codec), `memchr`, `flate2` (non-BGZF gzip
 input only), and `clap`.
 
