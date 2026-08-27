@@ -363,6 +363,14 @@ pub fn run(a: &MergeArgs) -> Result<(), String> {
         readers.push(r);
     }
 
+    // bcftools adds INFO/AN and INFO/AC only when an input header declares
+    // them (verified against 1.19: declared-but-absent still triggers it,
+    // undeclared never does). Beagle output declares neither, and silently
+    // growing its INFO would be a surprise.
+    let acan_declared = headers
+        .iter()
+        .any(|h| h.info.contains_key("AC") || h.info.contains_key("AN"));
+
     // Output sample list.
     let mut out_samples: Vec<String> = Vec::new();
     let mut seen: HashMap<String, usize> = HashMap::new();
@@ -391,7 +399,7 @@ pub fn run(a: &MergeArgs) -> Result<(), String> {
         "GT",
         "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">",
     );
-    if !a.no_update {
+    if !a.no_update && acan_declared {
         merged_hdr.ensure_meta("INFO", "AC", "##INFO=<ID=AC,Number=A,Type=Integer,Description=\"Allele count in genotypes\">");
         merged_hdr.ensure_meta("INFO", "AN", "##INFO=<ID=AN,Number=1,Type=Integer,Description=\"Total number of alleles in called genotypes\">");
     }
@@ -426,7 +434,7 @@ pub fn run(a: &MergeArgs) -> Result<(), String> {
 
     let rules = InfoRules::parse(&a.info_rules)?;
     let mode = MergeMode::parse(&a.merge)?;
-    let opts = EmitOpts { update: !a.no_update, missing_to_ref: a.missing_to_ref };
+    let opts = EmitOpts { update: !a.no_update && acan_declared, missing_to_ref: a.missing_to_ref };
 
     // Assembling merged records is the serial bottleneck whenever deflate is
     // not. With BGZF output the writer already saturates the machine, so

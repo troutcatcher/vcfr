@@ -338,6 +338,20 @@ everything sharing a REF, `none` creates no new multiallelics. Records whose
 alleles are already a subset of another's are combined under every mode, since
 that introduces no new allele.
 
+On imputation output such as Beagle's (phased `GT:DS:GP` with `DR2`/`AF`/`IMP`
+INFO and an identical site universe across cohorts), a 3-way merge of 300-sample
+cohorts measured 28-30x bcftools with plain output and ~4x with BGZF output:
+the uniform-site fast path copies each cohort's columns with one memcpy while
+bcftools decodes every dosage and genotype-probability float into its binary
+representation and re-renders it. Output was verified semantically identical —
+genotypes byte-for-byte, floats as values — since bcftools rewrites `0.0310`
+as `0.031` and reorders INFO keys, which vcfr deliberately does not. Note that
+merging follows bcftools' rule for `INFO/AC`+`INFO/AN`: they are recomputed
+and added only when an input header declares them, so Beagle-style files do
+not silently grow AC/AN. One robustness difference: inputs carrying different
+REF alleles at the same position (malformed against any single reference) make
+bcftools abort mid-merge, while vcfr emits them as separate records.
+
 Known limits: REF padding is not performed, so records at the same position with
 different REF strings (`A→AT` in one file, `AT→A` in another) stay separate
 rather than being rewritten onto a common REF. `Number=G` values (such as `PL`)

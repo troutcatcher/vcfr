@@ -208,6 +208,29 @@ $VCFR merge "$WORK/x1.vcf.gz" "$WORK/x2.vcf.gz" > "$WORK/v.out"
 bcftools merge "$WORK/x1.vcf.gz" "$WORK/x2.vcf.gz" > "$WORK/b.out"
 check "merge allele renumbering" "$WORK/v.out" "$WORK/b.out"
 
+# bcftools adds INFO/AN and INFO/AC only when an input header declares them
+# (Beagle output, for one, declares neither); vcfr must follow the same rule.
+for variant in undeclared declared; do
+  extra=""
+  [[ $variant == declared ]] && extra='##INFO=<ID=AC,Number=A,Type=Integer,Description="a">
+##INFO=<ID=AN,Number=1,Type=Integer,Description="n">'
+  for sm in M N; do
+    {
+      echo '##fileformat=VCFv4.2'
+      echo '##contig=<ID=chr1>'
+      echo '##INFO=<ID=DP,Number=1,Type=Integer,Description="d">'
+      [[ -n $extra ]] && echo "$extra"
+      echo '##FORMAT=<ID=GT,Number=1,Type=String,Description="g">'
+      printf '#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t%s1\n' "$sm"
+      printf 'chr1\t100\t.\tA\tG\t.\tPASS\tDP=7\tGT\t0|1\n'
+    } > "$WORK/$sm.vcf"
+    bgzip -f "$WORK/$sm.vcf" && bcftools index -f "$WORK/$sm.vcf.gz"
+  done
+  $VCFR merge "$WORK/M.vcf.gz" "$WORK/N.vcf.gz" > "$WORK/v.out"
+  bcftools merge "$WORK/M.vcf.gz" "$WORK/N.vcf.gz" > "$WORK/b.out"
+  check "merge AC/AN rule ($variant)" "$WORK/v.out" "$WORK/b.out"
+done
+
 echo
 echo "passed: $pass   failed: $fail"
 [[ $fail -eq 0 ]]
