@@ -402,6 +402,17 @@ doesn't. Output verified as above — fixed columns and INFO identical after
 float normalisation, all 900 GT columns byte-identical, DS/GP numerically
 equal on sampled lines. Peak RSS: vcfr ~40MiB, bcftools ~13MiB.
 
+`--render beagle` makes the generator mimic real Beagle byte habits,
+calibrated on a snapshot of production imputed bovine sequence data: floats
+trimmed of trailing zeros (`0|0:0:1,0,0`), IMP first in INFO, AF to four
+decimals, and GP fuzz scaling with site heterozygosity and 1−DR2. On that
+rendering (150k sites × 300 samples, ~73% of sample fields exactly
+`0|0:0:1,0,0`), stripping FORMAT fields and re-bgzipping measured: dropping
+DS+GP (keeping GT) shrinks the `.vcf.gz` by **74–75%**; dropping only GP
+while keeping DS saves **38%** — GP is largely predictable from DS, so the
+compressor was already paying little for it relative to its text size (it is
+half the uncompressed bytes but carries far less entropy).
+
 A GT-only variant of the same output (`examples/gen_beagle --gt-only`: phased
 `0|1` with no DS/GP and no DR2/AF/IMP — a phasing-only pipeline, or Beagle
 output already stripped of dosage) merges byte-for-byte identical to bcftools

@@ -47,6 +47,18 @@ fn arg(name: &str, default: &str) -> String {
 
 const BASES: [u8; 4] = [b'A', b'C', b'G', b'T'];
 
+/// `int.frac` with trailing zeros trimmed, Beagle-style: 0, 0.3, 0.38, 1, 2.
+fn trim_frac(int: u64, frac: u64, width: usize) -> String {
+    if frac == 0 {
+        return int.to_string();
+    }
+    let mut s = format!("{int}.{frac:0width$}");
+    while s.ends_with('0') {
+        s.pop();
+    }
+    s
+}
+
 fn main() {
     let sites: u64 = arg("--sites", "150000").parse().unwrap();
     let samples: usize = arg("--samples", "300").parse().unwrap();
@@ -63,6 +75,23 @@ fn main() {
         "uniform" => false,
         other => {
             eprintln!("unknown --af-spectrum '{other}' (expected seq or uniform)");
+            std::process::exit(1);
+        }
+    };
+    // `--render beagle` mimics real Beagle output byte habits, calibrated on
+    // a snapshot of production imputed bovine sequence data: floats trimmed
+    // of trailing zeros ("0:1,0,0", "2:0,0,1", "0.8"), IMP first in INFO,
+    // AF to 4 decimals, and genotype-probability fuzz that scales with site
+    // heterozygosity and (1 - DR2) — a rare confident site is exactly
+    // "0|0:0:1,0,0" while a common low-DR2 site reads "0|0:0.8:0.36,0.49,0.15".
+    // The default "fixed" keeps the original fixed-width rendering so the
+    // committed fixtures stay reproducible. Both modes consume identical RNG
+    // draws, so cohorts generated in either mode share a site universe.
+    let beagle_render = match arg("--render", "fixed").as_str() {
+        "beagle" => true,
+        "fixed" => false,
+        other => {
+            eprintln!("unknown --render '{other}' (expected fixed or beagle)");
             std::process::exit(1);
         }
     };
@@ -149,6 +178,23 @@ fn main() {
                     c + 1, pos, id, BASES[ref_i] as char, BASES[alt_i] as char,
                 )
                 .unwrap();
+            } else if beagle_render {
+                // Snapshot shape: "IMP;DR2=0.38;AF=0.3328" — IMP first,
+                // trimmed DR2, AF to 4 decimals trimmed.
+                let af_e4 = (af_e5 + 5) / 10;
+                write!(
+                    out,
+                    "chr{}\t{}\t{}\t{}\t{}\t.\tPASS\t{}DR2={};AF={}\tGT:DS:GP",
+                    c + 1,
+                    pos,
+                    id,
+                    BASES[ref_i] as char,
+                    BASES[alt_i] as char,
+                    if imputed { "IMP;" } else { "" },
+                    trim_frac(dr2 / 100, dr2 % 100, 2),
+                    trim_frac(af_e4 / 10000, af_e4 % 10000, 4),
+                )
+                .unwrap();
             } else {
                 write!(
                     out,
@@ -166,7 +212,16 @@ fn main() {
                 )
                 .unwrap();
             }
-            let _ = dr2;
+            // Genotype-probability fuzz scale for --render beagle: grows with
+            // site heterozygosity and imputation uncertainty. A rare or
+            // well-imputed site collapses to exact "0:1,0,0" calls; a common
+            // low-DR2 site spreads real probability mass off the call.
+            let fuzz_site = if beagle_render {
+                let af = af_e5 as f64 / 1e5;
+                (1.0 - dr2 as f64 / 100.0) * 2.0 * af * (1.0 - af)
+            } else {
+                0.0
+            };
 
             for _ in 0..samples {
                 let g = gt_rng.next();
@@ -178,6 +233,39 @@ fn main() {
                     continue;
                 }
                 let dose = a + b;
+                if beagle_render {
+                    // Heavy-tailed per-sample noise (r^2 keeps most samples
+                    // near-exact), in centi-probability units, capped so the
+                    // called genotype keeps the plurality of the mass.
+                    let r = ((g >> 32) & 0xffff) as f64 / 65536.0;
+                    let noise = ((fuzz_site * r * r * 260.0).min(60.0)) as u64;
+                    let split = (g >> 48) & 0xff; // how the off-call mass leans
+                    let (p0, p1, p2) = match dose {
+                        0 => {
+                            let p2 = noise * split / 1024; // far genotype gets little
+                            (100 - noise, noise - p2, p2)
+                        }
+                        1 => {
+                            let p0 = noise * split / 256;
+                            (p0, 100 - noise, noise - p0)
+                        }
+                        _ => {
+                            let p0 = noise * split / 1024;
+                            (p0, noise - p0, 100 - noise)
+                        }
+                    };
+                    let ds = p1 + 2 * p2;
+                    write!(
+                        out,
+                        "\t{a}|{b}:{}:{},{},{}",
+                        trim_frac(ds / 100, ds % 100, 2),
+                        trim_frac(p0 / 100, p0 % 100, 2),
+                        trim_frac(p1 / 100, p1 % 100, 2),
+                        trim_frac(p2 / 100, p2 % 100, 2),
+                    )
+                    .unwrap();
+                    continue;
+                }
                 // GP concentrated on the called genotype, Beagle-style rounding.
                 let noise = (g >> 40) % 6; // 0.00..0.05
                 let p_call = 100 - noise;
