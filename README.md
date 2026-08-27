@@ -74,45 +74,43 @@ seconds — the average parallelism actually achieved.
 
 | operation | bcftools | vcfr | speedup | cores b → v | CPU-s b → v | output b / v |
 | --- | ---: | ---: | ---: | :---: | :---: | :---: |
-| `view`: decompress to VCF | 19.40s | 0.88s | **22.1x** | 1.16 → 3.38 | 22.6 → 3.0 | — |
-| `view`: BGZF → BGZF re-compress | 26.22s | 11.53s | 2.27x † | 3.43 → 3.73 | 90.1 → 43.1 | 381M / 411M |
-| `view`: subset 50 of 500 samples, BGZF | 13.47s | 2.46s | 5.48x † | 1.75 → 3.37 | 23.6 → 8.3 | 43M / 46M |
-| `view`: subset 50 of 500 samples, VCF | 13.27s | 1.68s | **7.9x** | 1.22 → 2.46 | 16.3 → 4.1 | — |
-| `view`: SNPs only, BGZF | 22.24s | 9.27s | 2.39x † | 3.38 → 3.76 | 75.2 → 34.9 | 306M / 330M |
-| `view`: biallelic SNPs + PASS, BGZF | 20.66s | 8.16s | 2.53x † | 3.33 → 3.85 | 69.0 → 31.5 | 268M / 290M |
-| `view`: region `chr2`, BGZF | 15.50s | 3.30s | 4.69x † | 2.17 → 3.42 | 33.7 → 11.3 | 96M / 103M |
-| `view`: drop genotypes, BGZF | 12.20s | 2.03s | 5.99x † | 1.30 → 1.69 | 15.9 → 3.4 | 3.1M / 3.2M |
-| `concat`: 4 parts → BGZF | 19.34s | 11.67s | 1.65x † | 3.73 → 3.71 | 72.2 → 43.4 | 381M / 411M |
-| `concat --naive`: 4 parts → BGZF | 1.15s | 0.50s | 2.3x ‡ | 0.35 → 0.61 | 0.4 → 0.3 | 411M / 411M |
-| `merge`: 3 cohorts → BGZF | 27.26s | 10.98s | 2.48x † | 3.17 → 3.58 | 86.6 → 39.3 | 331M / 356M |
-| `merge`: 3 cohorts → VCF | 25.16s | 1.78s | **14.2x** | 1.12 → 3.38 | 28.3 → 6.0 | — |
+| `view`: decompress to VCF | 19.74s | 0.86s | **22.9x** | 1.16 → 3.39 | 22.9 → 2.9 | — |
+| `view`: BGZF → BGZF re-compress | 26.59s | 12.02s | 2.21x † | 3.41 → 3.86 | 90.9 → 46.5 | 381M / 411M |
+| `view`: subset 50 of 500 samples, BGZF | 13.60s | 2.45s | 5.55x † | 1.77 → 3.38 | 24.1 → 8.3 | 43M / 46M |
+| `view`: subset 50 of 500 samples, VCF | 13.71s | 1.77s | **7.7x** | 1.23 → 2.37 | 17.0 → 4.2 | — |
+| `view`: SNPs only, BGZF | 22.54s | 9.40s | 2.39x † | 3.40 → 3.79 | 76.7 → 35.7 | 306M / 330M |
+| `view`: biallelic SNPs + PASS, BGZF | 20.70s | 8.11s | 2.55x † | 3.32 → 3.88 | 68.9 → 31.5 | 268M / 290M |
+| `view`: region `chr2`, BGZF | 15.58s | 3.27s | 4.76x † | 2.16 → 3.47 | 33.7 → 11.4 | 96M / 103M |
+| `view`: drop genotypes, BGZF | 12.12s | 1.91s | 6.34x † | 1.29 → 1.73 | 15.7 → 3.3 | 3.1M / 3.2M |
+| `concat`: 4 parts → BGZF | 19.27s | 11.66s | 1.65x † | 3.71 → 3.80 | 71.5 → 44.3 | 381M / 411M |
+| `concat --naive`: 4 parts → BGZF | 1.14s | 0.52s | 2.2x ‡ | 0.37 → 0.82 | 0.4 → 0.4 | 411M / 411M |
+| `merge`: 3 cohorts → BGZF | 27.25s | 10.37s | 2.62x † | 3.15 → 3.81 | 85.9 → 39.6 | 331M / 356M |
+| `merge`: 3 cohorts → VCF | 24.83s | 1.68s | **14.8x** | 1.12 → 3.32 | 27.9 → 5.6 | — |
 
 Single-threaded — one OS thread each, all six measured at 0.99 cores, so this is
 the cleanest like-for-like comparison in the set:
 
 | operation | bcftools | vcfr | speedup | cores b → v |
 | --- | ---: | ---: | ---: | :---: |
-| `view`: decompress to VCF | 20.70s | 2.20s | **9.4x** | 0.99 → 0.99 |
-| `view`: BGZF → BGZF | 88.56s | 42.25s | 2.09x † | 0.99 → 0.99 |
-| `merge`: 3 cohorts → BGZF | 83.05s | 39.23s | 2.11x † | 0.99 → 0.99 |
+| `view`: decompress to VCF | 20.51s | 2.09s | **9.8x** | 0.99 → 0.99 |
+| `view`: BGZF → BGZF | 87.24s | 42.17s | 2.07x † | 0.99 → 0.99 |
+| `merge`: 3 cohorts → BGZF | 81.78s | 39.37s | 2.08x † | 0.99 → 0.99 |
 
 ### What the resource columns say
 
 **The speedups are not bought with extra cores.** On the compression-bound rows
-both tools sit in the same band — 3.43 vs 3.73, 3.38 vs 3.76, 3.33 vs 3.85 —
-and on `concat` they are level (3.73 vs 3.71) with `vcfr` still 1.65x faster.
-bcftools also spawns more OS threads than `vcfr` throughout (6-9 against 5-8):
-htslib's `--threads N` means N workers *beyond* the main thread, and it creates
-more than one pool. The CPU-seconds column is the efficiency measure, and on
-those rows it tracks the speedups closely — roughly half the CPU for the same
-work.
+both tools sit in the same band — 3.41 vs 3.86, 3.40 vs 3.79, 3.32 vs 3.88,
+3.71 vs 3.80 — and the CPU-seconds column, the efficiency measure, tracks the
+speedups closely: roughly half the CPU for the same work. bcftools also spawns
+more OS threads than `vcfr` throughout (6-9 against 5-8): htslib's `--threads N`
+means N workers *beyond* the main thread, and it creates more than one pool.
 
 **Two rows do depend on parallelism bcftools leaves unused.** Decompress to VCF
-has bcftools at 1.16 cores against `vcfr`'s 3.38, and `merge` to VCF 1.12
-against 3.38 — bcftools barely parallelises either path. Some of those 22.1x
-and 14.2x figures is that gap rather than the code. The underlying efficiency
-gaps are smaller but still large: 22.6 against 3.0 CPU-seconds, and 28.3 against
-6.0. The single-threaded rows isolate the first honestly at 9.4x.
+has bcftools at 1.16 cores against `vcfr`'s 3.39, and `merge` to VCF 1.12
+against 3.32 — bcftools barely parallelises either path. Some of those 22.9x
+and 14.8x figures is that gap rather than the code. The underlying efficiency
+gaps are smaller but still large: 22.9 against 2.9 CPU-seconds, and 27.9
+against 5.6. The single-threaded rows isolate the first honestly at 9.8x.
 
 ### † Read the BGZF-output rows carefully
 
@@ -123,29 +121,35 @@ faster but weaker. The rows marked † are therefore not comparing equal work �
 
 | encoder | time | output |
 | --- | ---: | ---: |
-| `bcftools -Oz` (zlib 6, the default) | 27.07s | 398,917,162 |
-| `vcfr -Oz -l 6` (libdeflate 6, the default) | 12.75s | 430,610,327 (+8.0%) |
-| `vcfr -Oz -l 7` | 18.95s | 398,712,552 (−0.05%) |
-| `vcfr -Oz -l 8` | 38.31s | 372,607,066 (−6.6%) |
+| `bcftools -Oz` (zlib 6, the default) | 26.80s | 398,917,159 |
+| `vcfr -Oz -l 1` | 4.59s | 498,181,180 (+24.9%) |
+| `vcfr -Oz -l 6` (libdeflate 6, the default) | 11.58s | 430,610,327 (+8.0%) |
+| `vcfr -Oz -l 7` | 18.54s | 398,712,552 (−0.05%) |
+| `vcfr -Oz -l 8` | 38.29s | 372,607,066 (−6.6%) |
 
-**At a matched compression ratio, `vcfr -l 7` beats `bcftools` by 1.43x on pure
+**At a matched compression ratio, `vcfr -l 7` beats `bcftools` by 1.45x on pure
 re-compression**, with the outputs within 0.05% of each other. An independent
 interleaved A/B put it at 1.45x, 1.45x, 1.44x over three rounds. Every † row
 should be read the same way: part of the margin is `vcfr` compressing less.
 Pass `-l 7` for output the size `bcftools` would have produced.
+
+The level curve is worth exploiting deliberately: the whole span from `-l 1` to
+`-l 8` trades an 8.3x range in time against a 34% range in size. For scratch
+and intermediate files, `-l 1` writes bcftools-default-sized-plus-a-quarter
+output at 5.8x bcftools' speed; for archives, `-l 8` out-compresses it.
 
 ### ‡ `concat --naive` is I/O-bound
 
 Both tools copy the same blocks and land within 4 KB of each other on a 411 MB
 output, so the comparison is like-for-like — but it is a file copy, and its
 ratio moves with page-cache and writeback state rather than with CPU. Across
-runs it measured anywhere from 1.8x to 4.4x (`vcfr` 0.35-0.61s against
-bcftools' 1.05-2.03s). Treat it as "roughly 2-3x, and not the interesting part".
+runs it measured anywhere from 1.8x to 4.4x. Treat it as "roughly 2-3x, and not
+the interesting part".
 
 The rows in bold are the ones the design targets: work bounded by parsing and
-moving bytes rather than by DEFLATE. Where DEFLATE dominates, `vcfr` is close to
-the machine's limit — `view -Oz` runs at 3.73 of 4 cores — and no further work
-on the record path will move it.
+moving bytes rather than by DEFLATE. Where DEFLATE dominates, `vcfr` sits at
+3.8-3.9 of 4 cores — within a few percent of the machine's limit — so the
+remaining lever there is the compression level, not the code.
 
 ### Notes on method
 
