@@ -29,6 +29,20 @@ command -v bcftools >/dev/null || { echo "bcftools is required" >&2; exit 1; }
 mkdir -p "$DATA"
 OUT=$(mktemp -d); trap 'rm -rf "$OUT"' EXIT
 
+# A full filesystem does not fail loudly here -- it silently inflates every
+# timing through writeback throttling, and truncates outputs. Both tools get
+# slower together, so the ratios still look plausible and nothing announces
+# that the run is worthless. Refuse to start instead.
+need=6
+[[ -f $DATA/big.$SITES.$SAMPLES.vcf.gz ]] || need=$((need + 4))
+for dir in "$DATA" "$OUT"; do
+  avail=$(df -BG --output=avail "$dir" | tail -1 | tr -dc '0-9')
+  if (( avail < need )); then
+    echo "not enough free space on $(df --output=target "$dir" | tail -1): ${avail}G available, ~${need}G needed" >&2
+    exit 1
+  fi
+done
+
 # ---------------------------------------------------------------- fixtures --
 BIG=$DATA/big.$SITES.$SAMPLES.vcf.gz
 if [[ ! -f $BIG ]]; then
