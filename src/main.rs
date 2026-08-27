@@ -2,6 +2,7 @@
 
 mod bgzf;
 mod cmd;
+mod deflate;
 mod io;
 mod lines;
 mod pool;

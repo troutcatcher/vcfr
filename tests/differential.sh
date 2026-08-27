@@ -94,6 +94,12 @@ bcftools view "$WORK/rt.vcf.gz" > "$WORK/v.out"
 bcftools view "$WORK/all.vcf" > "$WORK/b.out"
 check "BGZF written by vcfr" "$WORK/v.out" "$WORK/b.out"
 bcftools index -f "$WORK/rt.vcf.gz" && echo "ok    vcfr BGZF is indexable"
+# level 0 is vcfr's own DEFLATE encoder: htslib must read it back exactly
+$VCFR view -O z -l 0 -o "$WORK/rt0.vcf.gz" "$WORK/all.vcf"
+bcftools view "$WORK/rt0.vcf.gz" > "$WORK/v.out"
+check "BGZF written by vcfr -l 0" "$WORK/v.out" "$WORK/b.out"
+bcftools index -f "$WORK/rt0.vcf.gz" && echo "ok    vcfr -l 0 BGZF is indexable"
+
 bgzip -c "$WORK/all.vcf" > "$WORK/hts.vcf.gz"
 $VCFR view "$WORK/hts.vcf.gz" > "$WORK/v.out"
 check "BGZF written by bgzip" "$WORK/v.out" "$WORK/b.out"

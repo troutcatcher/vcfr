@@ -17,7 +17,8 @@ pub struct OutputOpts {
     #[arg(short = 'O', long = "output-type", value_name = "v|z")]
     pub output_type: Option<char>,
 
-    /// BGZF compression level (1-12)
+    /// BGZF compression level: 1-12 (libdeflate), or 0 for vcfr's built-in
+    /// encoder — the fastest option, with a ratio between levels 1 and 2
     #[arg(short = 'l', long = "compression-level", default_value_t = 6, value_name = "N")]
     pub level: u32,
 }

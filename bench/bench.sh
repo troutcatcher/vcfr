@@ -269,7 +269,7 @@ printf '%-28s %10s %14s\n' "----------------------------" "----------" "--------
 one() { best "$1"; printf '%.2f' "$BEST_WALL"; }
 d=$(one "bcftools view --threads $THREADS -O z -o $OUT/cal.gz $BIG")
 printf '%-28s %9ss %14s\n' "bcftools -Oz (zlib 6)" "$d" "$(stat -c %s "$OUT/cal.gz")"
-for L in 1 6 7 8; do
+for L in 0 1 6 7 8; do
   d=$(one "$VCFR view --threads $THREADS -O z -l $L -o $OUT/cal.gz $BIG")
   printf '%-28s %9ss %14s\n' "vcfr -Oz -l $L" "$d" "$(stat -c %s "$OUT/cal.gz")"
 done

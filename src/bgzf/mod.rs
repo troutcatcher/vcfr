@@ -168,6 +168,28 @@ pub fn is_gzip_header(head: &[u8]) -> bool {
     head.len() >= 2 && head[0] == 0x1f && head[1] == 0x8b
 }
 
+/// Deflate `data` into a complete BGZF block using vcfr's own preset-code
+/// encoder (`src/deflate`). CRC comes from crc32fast rather than libdeflate.
+pub fn deflate_block_preset(
+    codes: &crate::deflate::CodeSet,
+    m: &mut crate::deflate::Matcher,
+    data: &[u8],
+    out: &mut Vec<u8>,
+) {
+    debug_assert!(data.len() <= UNCOMPRESSED_BLOCK_SIZE);
+    out.clear();
+    out.extend_from_slice(&[
+        0x1f, 0x8b, 0x08, 0x04, 0, 0, 0, 0, 0, 0xff, 0x06, 0x00, b'B', b'C', 0x02, 0x00, 0, 0,
+    ]);
+    crate::deflate::compress_into(codes, m, data, out);
+    let crc = crc32fast::hash(data);
+    out.extend_from_slice(&crc.to_le_bytes());
+    out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    let total = out.len();
+    debug_assert!(total <= MAX_BLOCK_SIZE);
+    out[16..18].copy_from_slice(&((total - 1) as u16).to_le_bytes());
+}
+
 /// Deflate `data` into a complete BGZF block.
 pub fn deflate_block(c: &mut libdeflater::Compressor, data: &[u8], out: &mut Vec<u8>) {
     debug_assert!(data.len() <= UNCOMPRESSED_BLOCK_SIZE);
@@ -215,6 +237,37 @@ mod tests {
         }
         assert_eq!(got, data, "round trip mismatch");
         buf
+    }
+
+    #[test]
+    fn preset_engine_roundtrips_and_interoperates() {
+        // Level 0 = vcfr's own encoder. The stream must come back through the
+        // BGZF reader (which inflates with libdeflate) byte-for-byte.
+        let mut data = Vec::new();
+        let mut x = 7u64;
+        while data.len() < 5 * UNCOMPRESSED_BLOCK_SIZE + 1234 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            data.extend_from_slice(
+                format!("chr2\t{}\trs{}\tC\tT\t99\tPASS\tDP=42\tGT\t0/1\n", x % 999999, x % 777)
+                    .as_bytes(),
+            );
+        }
+        let mut buf = Vec::new();
+        {
+            let mut w = writer::BgzfWriter::new(&mut buf, 2, 0);
+            w.write_all(&data).unwrap();
+            w.finish().unwrap();
+        }
+        assert!(is_bgzf_header(&buf[..64]));
+        assert!(buf.ends_with(&EOF_BLOCK));
+        let mut r = reader::BgzfReader::new(std::io::Cursor::new(buf), 2);
+        let mut got = Vec::new();
+        while let Some(chunk) = r.next_chunk().unwrap() {
+            got.extend_from_slice(&chunk);
+        }
+        assert_eq!(got, data);
     }
 
     #[test]

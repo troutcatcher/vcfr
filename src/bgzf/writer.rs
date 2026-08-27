@@ -1,26 +1,48 @@
 //! Multi-threaded BGZF compression.
 
+use std::cell::RefCell;
 use std::io::{self, Write};
+use std::sync::Arc;
 
-use super::{deflate_block, EOF_BLOCK, UNCOMPRESSED_BLOCK_SIZE};
+use super::{deflate_block, deflate_block_preset, EOF_BLOCK, UNCOMPRESSED_BLOCK_SIZE};
+use crate::deflate::{CodeSet, Matcher};
 use crate::pool::OrderedPool;
+
+thread_local! {
+    static MATCHER: RefCell<Matcher> = RefCell::new(Matcher::default());
+}
+
+/// Which encoder turns a block into deflate bits.
+enum Engine {
+    /// libdeflate at a given level (1-12).
+    Lib(i32),
+    /// vcfr's preset-code encoder (level 0). Codes are trained on early
+    /// blocks and refreshed occasionally; every job holds an Arc to the set
+    /// it was submitted with, so retraining never affects blocks in flight.
+    Preset { codes: Option<Arc<CodeSet>>, blocks: u64 },
+}
 
 pub struct BgzfWriter<W: Write> {
     inner: W,
     /// `None` when compressing inline on the calling thread.
     pool: Option<OrderedPool<Vec<u8>>>,
     inline: Option<libdeflater::Compressor>,
+    engine: Engine,
     scratch: Vec<u8>,
     buf: Vec<u8>,
-    level: i32,
     finished: bool,
 }
 
 impl<W: Write> BgzfWriter<W> {
     /// `workers` compression threads; `0` deflates inline on the calling
     /// thread, so a caller asking for one thread really gets one thread.
+    /// Level 0 selects vcfr's own preset-code encoder; 1-12 are libdeflate.
     pub fn new(inner: W, workers: usize, level: u32) -> Self {
-        let level = level.clamp(1, 12) as i32;
+        let engine = if level == 0 {
+            Engine::Preset { codes: None, blocks: 0 }
+        } else {
+            Engine::Lib(level.clamp(1, 12) as i32)
+        };
         BgzfWriter {
             inner,
             // Depth is blocks in flight between the feeding thread and the
@@ -29,14 +51,15 @@ impl<W: Write> BgzfWriter<W> {
             // at level 1 and 3.7 at level 6. At 16 per worker (~4 MiB) both
             // reach ~3.85; 48 buys nothing more.
             pool: (workers >= 1).then(|| OrderedPool::new(workers, workers * 16)),
-            inline: (workers == 0).then(|| {
+            inline: (workers == 0 && level != 0).then(|| {
                 libdeflater::Compressor::new(
-                    libdeflater::CompressionLvl::new(level).expect("valid compression level"),
+                    libdeflater::CompressionLvl::new(level.clamp(1, 12) as i32)
+                        .expect("valid compression level"),
                 )
             }),
+            engine,
             scratch: Vec::with_capacity(UNCOMPRESSED_BLOCK_SIZE),
             buf: Vec::with_capacity(UNCOMPRESSED_BLOCK_SIZE),
-            level,
             finished: false,
         }
     }
@@ -60,6 +83,39 @@ impl<W: Write> BgzfWriter<W> {
         if self.buf.is_empty() {
             return Ok(());
         }
+        let level = match &mut self.engine {
+            Engine::Lib(l) => *l,
+            Engine::Preset { codes, blocks } => {
+                // Train on the first block, retrain once clear of the VCF
+                // header, then occasionally in case the data drifts. Jobs in
+                // flight keep the Arc they were submitted with.
+                if codes.is_none() || *blocks == 8 || *blocks % 65536 == 0 {
+                    let set = MATCHER
+                        .with(|m| CodeSet::train(&self.buf, &mut m.borrow_mut()));
+                    *codes = Some(Arc::new(set));
+                }
+                *blocks += 1;
+                let codes = Arc::clone(codes.as_ref().unwrap());
+                if self.pool.is_none() {
+                    MATCHER.with(|m| {
+                        deflate_block_preset(&codes, &mut m.borrow_mut(), &self.buf, &mut self.scratch)
+                    });
+                    self.inner.write_all(&self.scratch)?;
+                    self.buf.clear();
+                    return Ok(());
+                }
+                let data =
+                    std::mem::replace(&mut self.buf, Vec::with_capacity(UNCOMPRESSED_BLOCK_SIZE));
+                self.pool.as_mut().unwrap().submit(move || {
+                    MATCHER.with(|m| {
+                        let mut out = Vec::with_capacity(data.len() / 2 + 64);
+                        deflate_block_preset(&codes, &mut m.borrow_mut(), &data, &mut out);
+                        out
+                    })
+                });
+                return self.drain(false);
+            }
+        };
         if let Some(c) = &mut self.inline {
             deflate_block(c, &self.buf, &mut self.scratch);
             self.inner.write_all(&self.scratch)?;
@@ -67,7 +123,6 @@ impl<W: Write> BgzfWriter<W> {
             return Ok(());
         }
         let data = std::mem::replace(&mut self.buf, Vec::with_capacity(UNCOMPRESSED_BLOCK_SIZE));
-        let level = self.level;
         self.pool.as_mut().expect("pool or inline compressor").submit(move || {
             let mut c = libdeflater::Compressor::new(
                 libdeflater::CompressionLvl::new(level).expect("valid compression level"),

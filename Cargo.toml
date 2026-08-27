@@ -12,6 +12,7 @@ libdeflater = "1.26"
 memchr = "2"
 clap = { version = "4", features = ["derive"] }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+crc32fast = "1.5.1"
 
 [profile.release]
 opt-level = 3
