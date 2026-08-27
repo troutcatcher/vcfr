@@ -27,7 +27,25 @@ inflation and deflation are farmed out to a worker pool and reassembled in
 order (`src/pool.rs`). `libdeflate` does the actual codec work. It is much
 faster than zlib at inflating; at deflating it is faster mainly because its
 levels are calibrated differently, so see the compression note below the
-benchmark table before reading anything into the `-O z` numbers. The thread budget
+benchmark table before reading anything into the `-O z` numbers.
+
+**Level 0 is vcfr's own DEFLATE encoder** (`src/deflate`), written for this
+workload. libdeflate must treat every 64 KiB block as unknown data — count
+symbol frequencies, build Huffman codes, then emit, per block. VCF blocks all
+look alike, so `-l 0` trains one canonical code set on an early block and
+compresses every block in a single greedy pass with no counting and no code
+construction, probing with a 6-byte hash because VCF text is saturated with
+4-byte collisions (`\t0/0`, `:12,`) that waste 4-byte probes. On real VCF text
+it beats libdeflate level 1 on both axes — 240-262 MB/s against 227-235 at a
+better ratio (4.13-4.15 against 3.95-3.97) — and reaches 98-99% of level 2's
+ratio at roughly twice level 2's speed. The output is ordinary DEFLATE:
+htslib reads and indexes it, `gzip -t` accepts it, and the test suite
+round-trips every stream through libdeflate's own decoder. Levels 1-12 remain
+libdeflate, whose levels 3+ reach ratios the specialised encoder does not try
+for; decompression is libdeflate throughout. On data unlike its training
+block the encoder stays correct — codes are smoothed so every byte value can
+be emitted, and a stored-block fallback bounds the incompressible case — it
+just compresses less well. The thread budget
 is split between reading and writing according to which one is the bottleneck:
 deflating costs several times more than inflating, so with `-O z` most threads
 go to the writer, and with `-O v` they all go to the reader. `--threads N`
@@ -133,10 +151,11 @@ interleaved A/B put it at 1.45x, 1.45x, 1.44x over three rounds. Every † row
 should be read the same way: part of the margin is `vcfr` compressing less.
 Pass `-l 7` for output the size `bcftools` would have produced.
 
-The level curve is worth exploiting deliberately: the whole span from `-l 1` to
-`-l 8` trades an 8.3x range in time against a 34% range in size. For scratch
-and intermediate files, `-l 1` writes bcftools-default-sized-plus-a-quarter
-output at 5.8x bcftools' speed; for archives, `-l 8` out-compresses it.
+The level curve is worth exploiting deliberately: the whole span from `-l 0` to
+`-l 8` trades a large range in time against a 34% range in size. For scratch
+and intermediate files, `-l 0` (vcfr's own encoder) is the best fast point —
+about 5% faster than `-l 1` end-to-end with 4.3% smaller output; for archives,
+`-l 8` out-compresses bcftools' default.
 
 ### ‡ `concat --naive` is I/O-bound
 
