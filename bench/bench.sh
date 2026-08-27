@@ -33,8 +33,12 @@ OUT=$(mktemp -d); trap 'rm -rf "$OUT"' EXIT
 # timing through writeback throttling, and truncates outputs. Both tools get
 # slower together, so the ratios still look plausible and nothing announces
 # that the run is worthless. Refuse to start instead.
-need=6
-[[ -f $DATA/big.$SITES.$SAMPLES.vcf.gz ]] || need=$((need + 4))
+# Scale the requirement with the fixture: ~22 bytes of VCF text per genotype,
+# BGZF at roughly a sixth of that, and the working set is a few BGZF-sized
+# files (fixtures, parts, cohorts, and both tools' outputs).
+text_gb=$(( SITES * SAMPLES * 22 / 1000000000 ))
+need=$(( text_gb + 3 ))
+[[ -f $DATA/big.$SITES.$SAMPLES.vcf.gz ]] || need=$(( need + text_gb / 3 + 1 ))
 for dir in "$DATA" "$OUT"; do
   avail=$(df -BG --output=avail "$dir" | tail -1 | tr -dc '0-9')
   if (( avail < need )); then
