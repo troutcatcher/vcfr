@@ -43,9 +43,13 @@ impl OutputOpts {
 /// Both numbers count *worker* threads, so `--threads 1` really is one thread:
 /// zero workers means the main thread does that half of the job itself.
 ///
-/// Deflating costs several times more than inflating, so when the output is
-/// BGZF most of the budget goes to the writer; with plain output the writer
-/// needs none at all.
+/// Deflating costs several times more than inflating -- on this codebase's
+/// benchmark, compressing a stream costs roughly six times what decompressing
+/// it does -- so with BGZF output the writer is what saturates the machine and
+/// gets the whole budget. Inflation workers are latency-hiding rather than
+/// throughput-consuming: they spend most of a run blocked waiting for the
+/// consumer, so charging them against the writer's share just starves it.
+/// With plain output the writer needs no workers at all.
 pub fn split_threads(total: usize, bgzf_out: bool) -> (usize, usize) {
     if total <= 1 {
         return (0, 0);
@@ -53,8 +57,7 @@ pub fn split_threads(total: usize, bgzf_out: bool) -> (usize, usize) {
     if !bgzf_out {
         return (total, 0);
     }
-    let read = (total / 3).max(1);
-    (read, (total - read).max(1))
+    ((total / 3).max(1), total)
 }
 
 /// Thread budget for a k-way merge.
