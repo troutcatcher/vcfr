@@ -79,6 +79,14 @@ impl<S: BufSource> LineReader<S> {
         }
     }
 
+    /// Dissolve the reader, returning the not-yet-consumed bytes of its
+    /// current buffer and the underlying source. Only meaningful when the last
+    /// returned line was complete (no partial line pending), which holds after
+    /// reading a header terminated by its newline.
+    pub fn into_rest(self) -> (Vec<u8>, S) {
+        (self.buf[self.pos.min(self.buf.len())..].to_vec(), self.src)
+    }
+
     /// The line produced by the last successful `advance`, without its newline.
     #[inline]
     pub fn line(&self) -> &[u8] {

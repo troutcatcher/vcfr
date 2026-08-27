@@ -3,6 +3,7 @@
 use std::io::Write;
 
 use crate::io::open_reader;
+use crate::lines::BufSource;
 use crate::vcf::header::{select_samples, Header};
 use crate::vcf::record::*;
 use crate::vcf::RegionSet;
@@ -164,6 +165,38 @@ pub fn run(a: &ViewArgs) -> Result<(), String> {
         && !a.drop_genotypes
         && selected.as_ref().map_or(false, |s| s.len() != hdr.samples.len());
     let needs_samples = selected.is_some() || a.drop_genotypes || update_info || a.min_ac.is_some();
+
+    // With nothing to filter and no sample change, every record line passes
+    // through verbatim — so the line loop below would only re-derive the byte
+    // stream the reader already produced. Stream decompressed chunks straight
+    // into the writer instead: no line scanning, no per-line writes. Bytes
+    // are copied as-is, which for a well-formed VCF (newline-terminated,
+    // no CR) is exactly what the line loop emits.
+    let passthrough = selected.is_none()
+        && regions.is_none()
+        && want_types.is_none()
+        && drop_types.is_none()
+        && filters.is_none()
+        && ids.is_none()
+        && a.min_alleles.is_none()
+        && a.max_alleles.is_none()
+        && a.min_qual.is_none()
+        && a.max_qual.is_none()
+        && a.min_ac.is_none()
+        && !a.drop_genotypes;
+    if passthrough {
+        let res = (|| -> std::io::Result<()> {
+            let (rest, mut src) = rdr.into_rest();
+            w.write_all(&rest)?;
+            while let Some(chunk) = src.next_chunk()? {
+                w.write_all(&chunk)?;
+                src.recycle(chunk);
+            }
+            Ok(())
+        })();
+        ignore_broken_pipe(res)?;
+        return finish(w);
+    }
 
     let mut rec = Record::new();
     let mut gts: Vec<i32> = Vec::with_capacity(4);
