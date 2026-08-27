@@ -190,6 +190,22 @@ pub fn deflate_block_preset(
     out[16..18].copy_from_slice(&((total - 1) as u16).to_le_bytes());
 }
 
+/// Build a complete BGZF block with the high-effort per-block-Huffman encoder.
+pub fn deflate_block_high(m: &mut crate::deflate::HighMatcher, data: &[u8], out: &mut Vec<u8>) {
+    debug_assert!(data.len() <= UNCOMPRESSED_BLOCK_SIZE);
+    out.clear();
+    out.extend_from_slice(&[
+        0x1f, 0x8b, 0x08, 0x04, 0, 0, 0, 0, 0, 0xff, 0x06, 0x00, b'B', b'C', 0x02, 0x00, 0, 0,
+    ]);
+    crate::deflate::compress_high_into(m, data, out);
+    let crc = crc32fast::hash(data);
+    out.extend_from_slice(&crc.to_le_bytes());
+    out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    let total = out.len();
+    debug_assert!(total <= MAX_BLOCK_SIZE);
+    out[16..18].copy_from_slice(&((total - 1) as u16).to_le_bytes());
+}
+
 /// Deflate `data` into a complete BGZF block.
 pub fn deflate_block(c: &mut libdeflater::Compressor, data: &[u8], out: &mut Vec<u8>) {
     debug_assert!(data.len() <= UNCOMPRESSED_BLOCK_SIZE);
@@ -226,7 +242,7 @@ mod tests {
     fn roundtrip(data: &[u8], threads: usize, level: u32) -> Vec<u8> {
         let mut buf = Vec::new();
         {
-            let mut w = writer::BgzfWriter::new(&mut buf, threads, level);
+            let mut w = writer::BgzfWriter::new(&mut buf, threads, level, false);
             w.write_all(data).unwrap();
             w.finish().unwrap();
         }
@@ -256,7 +272,7 @@ mod tests {
         }
         let mut buf = Vec::new();
         {
-            let mut w = writer::BgzfWriter::new(&mut buf, 2, 0);
+            let mut w = writer::BgzfWriter::new(&mut buf, 2, 0, false);
             w.write_all(&data).unwrap();
             w.finish().unwrap();
         }

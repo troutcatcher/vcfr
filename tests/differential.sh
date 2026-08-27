@@ -99,6 +99,14 @@ $VCFR view -O z -l 0 -o "$WORK/rt0.vcf.gz" "$WORK/all.vcf"
 bcftools view "$WORK/rt0.vcf.gz" > "$WORK/v.out"
 check "BGZF written by vcfr -l 0" "$WORK/v.out" "$WORK/b.out"
 bcftools index -f "$WORK/rt0.vcf.gz" && echo "ok    vcfr -l 0 BGZF is indexable"
+# --codec rust routes levels 1-6 to the high-effort Rust encoder: htslib must
+# read those streams back exactly too
+for rl in 1 6; do
+  $VCFR view -O z --codec rust -l $rl -o "$WORK/rtr.vcf.gz" "$WORK/all.vcf"
+  bcftools view "$WORK/rtr.vcf.gz" > "$WORK/v.out"
+  check "BGZF written by vcfr --codec rust -l $rl" "$WORK/v.out" "$WORK/b.out"
+done
+bcftools index -f "$WORK/rtr.vcf.gz" && echo "ok    vcfr --codec rust BGZF is indexable"
 
 bgzip -c "$WORK/all.vcf" > "$WORK/hts.vcf.gz"
 $VCFR view "$WORK/hts.vcf.gz" > "$WORK/v.out"

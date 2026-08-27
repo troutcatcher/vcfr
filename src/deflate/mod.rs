@@ -12,7 +12,10 @@
 //! end of the curve on data whose statistics are stable across blocks, and it
 //! is benchmarked against libdeflate rather than assumed faster.
 
+mod high;
 mod huffman;
+
+pub use high::{compress_high_into, effort_for_level, HighMatcher};
 
 const MAX_MATCH: usize = 258;
 const MIN_MATCH: usize = 4;
@@ -141,9 +144,15 @@ impl CodeSet {
         let mut dist_freq = [1u64; 30];
         parse::<false>(sample, matcher, None, &mut lit_freq, &mut dist_freq, &mut Vec::new());
         lit_freq[256] += 16; // EOB fires once per block
+        Self::from_freqs(&lit_freq, &dist_freq)
+    }
 
-        let lit_lens = huffman::build_lengths(&lit_freq, 15);
-        let dist_lens = huffman::build_lengths(&dist_freq, 15);
+    /// Build a code set for exactly these frequencies — no smoothing, so
+    /// symbols that never occur get no code. Used per block by the
+    /// high-effort encoder, where the counts are this block's own.
+    pub fn from_freqs(lit_freq: &[u64; 286], dist_freq: &[u64; 30]) -> CodeSet {
+        let lit_lens = huffman::build_lengths(lit_freq, 15);
+        let dist_lens = huffman::build_lengths(dist_freq, 15);
         let lit_codes = huffman::assign_codes(&lit_lens);
         let dist_codes = huffman::assign_codes(&dist_lens);
         let (header_words, header_nbits) = huffman::build_header(&lit_lens, &dist_lens);
@@ -364,18 +373,24 @@ pub fn compress_into(codes: &CodeSet, m: &mut Matcher, data: &[u8], out: &mut Ve
     if out.len() - start > data.len() + 5 * (data.len() / 65535 + 1) {
         // Incompressible: rewrite as stored blocks.
         out.truncate(start);
-        let mut off = 0;
-        while off < data.len() || data.is_empty() {
-            let chunk = (data.len() - off).min(65535);
-            let last = off + chunk == data.len();
-            out.push(if last { 1 } else { 0 });
-            out.extend_from_slice(&(chunk as u16).to_le_bytes());
-            out.extend_from_slice(&(!(chunk as u16)).to_le_bytes());
-            out.extend_from_slice(&data[off..off + chunk]);
-            off += chunk;
-            if data.is_empty() {
-                break;
-            }
+        store_uncompressed(data, out);
+    }
+}
+
+/// Emit `data` as DEFLATE stored (BTYPE=00) blocks — the incompressible-input
+/// fallback shared by both encoders.
+fn store_uncompressed(data: &[u8], out: &mut Vec<u8>) {
+    let mut off = 0;
+    while off < data.len() || data.is_empty() {
+        let chunk = (data.len() - off).min(65535);
+        let last = off + chunk == data.len();
+        out.push(if last { 1 } else { 0 });
+        out.extend_from_slice(&(chunk as u16).to_le_bytes());
+        out.extend_from_slice(&(!(chunk as u16)).to_le_bytes());
+        out.extend_from_slice(&data[off..off + chunk]);
+        off += chunk;
+        if data.is_empty() {
+            break;
         }
     }
 }

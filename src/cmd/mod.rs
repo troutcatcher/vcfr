@@ -21,6 +21,12 @@ pub struct OutputOpts {
     /// encoder — the fastest option, with a ratio between levels 1 and 2
     #[arg(short = 'l', long = "compression-level", default_value_t = 6, value_name = "N")]
     pub level: u32,
+
+    /// Codec for BGZF output: "lib" (libdeflate, default) or "rust" — vcfr's
+    /// pure-Rust encoders throughout: level 0 as always, levels 1-6 mapped to
+    /// the high-effort per-block-Huffman encoder
+    #[arg(long = "codec", value_name = "lib|rust", default_value = "lib")]
+    pub codec: String,
 }
 
 impl OutputOpts {
@@ -35,7 +41,16 @@ impl OutputOpts {
 
     pub fn writer(&self, threads: usize) -> Result<Writer, String> {
         let bgzf = self.bgzf()?;
-        Writer::create(self.output.as_deref(), bgzf, threads, self.level).map_err(|e| e.to_string())
+        let rust_codec = match self.codec.as_str() {
+            "lib" => false,
+            "rust" => true,
+            c => return Err(format!("unknown codec '{c}' (expected lib or rust)")),
+        };
+        if rust_codec && self.level > 6 {
+            return Err("--codec rust supports levels 0-6".to_string());
+        }
+        Writer::create(self.output.as_deref(), bgzf, threads, self.level, rust_codec)
+            .map_err(|e| e.to_string())
     }
 }
 

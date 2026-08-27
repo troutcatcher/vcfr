@@ -98,7 +98,7 @@ pub enum Writer {
 }
 
 impl Writer {
-    pub fn create(path: Option<&str>, bgzf: bool, threads: usize, level: u32) -> io::Result<Writer> {
+    pub fn create(path: Option<&str>, bgzf: bool, threads: usize, level: u32, rust_codec: bool) -> io::Result<Writer> {
         let sink: Box<dyn Write + Send> = match path {
             None | Some("-") => Box::new(io::stdout()),
             Some(p) => Box::new(
@@ -107,7 +107,7 @@ impl Writer {
         };
         let buffered = BufWriter::with_capacity(1 << 20, sink);
         Ok(if bgzf {
-            Writer::Bgzf(BgzfWriter::new(buffered, threads, level))
+            Writer::Bgzf(BgzfWriter::new(buffered, threads, level, rust_codec))
         } else {
             Writer::Plain(buffered)
         })

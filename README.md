@@ -41,11 +41,28 @@ better ratio (4.13-4.15 against 3.95-3.97) — and reaches 98-99% of level 2's
 ratio at roughly twice level 2's speed. The output is ordinary DEFLATE:
 htslib reads and indexes it, `gzip -t` accepts it, and the test suite
 round-trips every stream through libdeflate's own decoder. Levels 1-12 remain
-libdeflate, whose levels 3+ reach ratios the specialised encoder does not try
-for; decompression is libdeflate throughout. On data unlike its training
-block the encoder stays correct — codes are smoothed so every byte value can
-be emitted, and a stored-block fallback bounds the incompressible case — it
-just compresses less well. The thread budget
+libdeflate by default; decompression is libdeflate throughout. On data unlike
+its training block the encoder stays correct — codes are smoothed so every
+byte value can be emitted, and a stored-block fallback bounds the
+incompressible case — it just compresses less well.
+
+**`--codec rust` extends the pure-Rust range to higher ratios**
+(`src/deflate/high.rs`): levels 1-6 route to a second built-in encoder that
+tokenizes each block with a lazy hash-chain matcher (chain depth 8→256 by
+level) and then builds *exact* per-block Huffman codes from that block's own
+token counts — the opposite trade to `-l 0`'s preset codes. Measured on
+64 KiB blocks of real merged VCF against libdeflate in the same run, it
+traces libdeflate's speed/ratio frontier from about l4 to l9 rather than
+beating it (rust-3 ≈ l6's point, rust-4 sits between l6 and l7, rust-6 ≈ l9),
+which is itself the honest headline: ~350 lines of safe-ish Rust matching a
+mature C library's mid levels point-for-point. End-to-end it does win one
+place: in `merge -Oz` at 4 threads, `--codec rust -l 4` finished in 9.0s at
+151MB where libdeflate `-l 7` took 11.2s for 149MB — the matched-ratio
+recommendation on rare-variant data. Neither encoder uses explicit SIMD: the
+hot loops are SWAR (unaligned 64-bit loads, XOR + trailing-zero count to
+extend matches); SIMD enters only through `crc32fast`'s hardware CRC path.
+
+The thread budget
 is split between reading and writing according to which one is the bottleneck:
 deflating costs several times more than inflating, so with `-O z` most threads
 go to the writer, and with `-O v` they all go to the reader. `--threads N`

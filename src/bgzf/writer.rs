@@ -4,12 +4,13 @@ use std::cell::RefCell;
 use std::io::{self, Write};
 use std::sync::Arc;
 
-use super::{deflate_block, deflate_block_preset, EOF_BLOCK, UNCOMPRESSED_BLOCK_SIZE};
-use crate::deflate::{CodeSet, Matcher};
+use super::{deflate_block, deflate_block_high, deflate_block_preset, EOF_BLOCK, UNCOMPRESSED_BLOCK_SIZE};
+use crate::deflate::{CodeSet, HighMatcher, Matcher};
 use crate::pool::OrderedPool;
 
 thread_local! {
     static MATCHER: RefCell<Matcher> = RefCell::new(Matcher::default());
+    static HIGH_MATCHER: RefCell<HighMatcher> = RefCell::new(HighMatcher::default());
 }
 
 /// Which encoder turns a block into deflate bits.
@@ -20,6 +21,9 @@ enum Engine {
     /// blocks and refreshed occasionally; every job holds an Arc to the set
     /// it was submitted with, so retraining never affects blocks in flight.
     Preset { codes: Option<Arc<CodeSet>>, blocks: u64 },
+    /// vcfr's high-effort encoder (`--codec rust`, levels 1-6): per-block
+    /// optimal Huffman over a lazy hash-chain matcher.
+    High { chain: usize, nice: usize, lazy: usize },
 }
 
 pub struct BgzfWriter<W: Write> {
@@ -36,10 +40,14 @@ pub struct BgzfWriter<W: Write> {
 impl<W: Write> BgzfWriter<W> {
     /// `workers` compression threads; `0` deflates inline on the calling
     /// thread, so a caller asking for one thread really gets one thread.
-    /// Level 0 selects vcfr's own preset-code encoder; 1-12 are libdeflate.
-    pub fn new(inner: W, workers: usize, level: u32) -> Self {
+    /// Level 0 selects vcfr's own preset-code encoder; 1-12 are libdeflate
+    /// unless `rust_codec` routes them to the built-in high-effort encoder.
+    pub fn new(inner: W, workers: usize, level: u32, rust_codec: bool) -> Self {
         let engine = if level == 0 {
             Engine::Preset { codes: None, blocks: 0 }
+        } else if rust_codec {
+            let (chain, nice, lazy) = crate::deflate::effort_for_level(level);
+            Engine::High { chain, nice, lazy }
         } else {
             Engine::Lib(level.clamp(1, 12) as i32)
         };
@@ -51,7 +59,7 @@ impl<W: Write> BgzfWriter<W> {
             // at level 1 and 3.7 at level 6. At 16 per worker (~4 MiB) both
             // reach ~3.85; 48 buys nothing more.
             pool: (workers >= 1).then(|| OrderedPool::new(workers, workers * 16)),
-            inline: (workers == 0 && level != 0).then(|| {
+            inline: (workers == 0 && level != 0 && !rust_codec).then(|| {
                 libdeflater::Compressor::new(
                     libdeflater::CompressionLvl::new(level.clamp(1, 12) as i32)
                         .expect("valid compression level"),
@@ -110,6 +118,31 @@ impl<W: Write> BgzfWriter<W> {
                     MATCHER.with(|m| {
                         let mut out = Vec::with_capacity(data.len() / 2 + 64);
                         deflate_block_preset(&codes, &mut m.borrow_mut(), &data, &mut out);
+                        out
+                    })
+                });
+                return self.drain(false);
+            }
+            Engine::High { chain, nice, lazy } => {
+                let (chain, nice, lazy) = (*chain, *nice, *lazy);
+                if self.pool.is_none() {
+                    HIGH_MATCHER.with(|m| {
+                        let mut m = m.borrow_mut();
+                        m.set_effort(chain, nice, lazy);
+                        deflate_block_high(&mut m, &self.buf, &mut self.scratch);
+                    });
+                    self.inner.write_all(&self.scratch)?;
+                    self.buf.clear();
+                    return Ok(());
+                }
+                let data =
+                    std::mem::replace(&mut self.buf, Vec::with_capacity(UNCOMPRESSED_BLOCK_SIZE));
+                self.pool.as_mut().unwrap().submit(move || {
+                    HIGH_MATCHER.with(|m| {
+                        let mut m = m.borrow_mut();
+                        m.set_effort(chain, nice, lazy);
+                        let mut out = Vec::with_capacity(data.len() / 2 + 64);
+                        deflate_block_high(&mut m, &data, &mut out);
                         out
                     })
                 });

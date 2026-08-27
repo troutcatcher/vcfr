@@ -14,7 +14,9 @@ fn main() {
     let mb = data.len() as f64 / 1e6;
     println!("{} blocks, {:.0} MB", blocks.len(), mb);
 
-    for level in [1i32, 2, 3, 6] {
+    let quick = std::env::var("DEFL2_QUICK").is_ok();
+    let levels: &[i32] = if quick { &[4, 5, 6, 7] } else { &[1, 2, 3, 6, 7, 9, 12] };
+    for &level in levels {
         let t = Instant::now();
         let mut total = 0usize;
         let mut c = libdeflater::Compressor::new(libdeflater::CompressionLvl::new(level).unwrap());
@@ -30,6 +32,29 @@ fn main() {
             data.len() as f64 / total as f64,
             total
         );
+    }
+    if quick {
+        let mut hm = deflate::HighMatcher::default();
+        let mut out = Vec::with_capacity(0x1_0000);
+        let mut best = f64::MAX;
+        let mut total = 0usize;
+        for _ in 0..4 {
+            let t = Instant::now();
+            total = 0;
+            for b in &blocks {
+                out.clear();
+                deflate::compress_high_into(&mut hm, b, &mut out);
+                total += out.len();
+            }
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        println!(
+            "vcfr-rs-high : {:>7.1} MB/s (best of 4)   ratio {:.3}   {} bytes",
+            mb / best,
+            data.len() as f64 / total as f64,
+            total
+        );
+        return;
     }
 
     let mut m = deflate::Matcher::default();
@@ -53,6 +78,27 @@ fn main() {
     }
     println!(
         "vcfr-rs      : {:>7.1} MB/s (best of 4)   ratio {:.3}   {} bytes",
+        mb / best,
+        data.len() as f64 / total as f64,
+        total
+    );
+
+    // High-effort path: per-block optimal Huffman + lazy chain matching.
+    let mut hm = deflate::HighMatcher::default();
+    let mut best = f64::MAX;
+    let mut total = 0usize;
+    for _ in 0..4 {
+        let t = Instant::now();
+        total = 0;
+        for b in &blocks {
+            out.clear();
+            deflate::compress_high_into(&mut hm, b, &mut out);
+            total += out.len();
+        }
+        best = best.min(t.elapsed().as_secs_f64());
+    }
+    println!(
+        "vcfr-rs-high : {:>7.1} MB/s (best of 4)   ratio {:.3}   {} bytes",
         mb / best,
         data.len() as f64 / total as f64,
         total
