@@ -75,7 +75,11 @@ for i in 1 2 3; do
   COHORTS+=("$C")
 done
 PARTS="$DATA/part1.$SITES.$SAMPLES.vcf.gz $DATA/part2.$SITES.$SAMPLES.vcf.gz $DATA/part3.$SITES.$SAMPLES.vcf.gz $DATA/part4.$SITES.$SAMPLES.vcf.gz"
-SAMPLE_SUBSET=$(bcftools query -l "$BIG" | head -50 | paste -sd,)
+# Not a pipeline: `bcftools query -l | head` races head's pipe-close against
+# bcftools' write, and with enough samples bcftools loses, dies with SIGPIPE,
+# and pipefail turns that into a silent abort of the whole benchmark.
+bcftools query -l "$BIG" > "$OUT/samples.txt"
+SAMPLE_SUBSET=$(head -50 "$OUT/samples.txt" | paste -sd,)
 
 echo
 printf 'input: %s (%s)\n' "$(basename "$BIG")" "$(du -h "$BIG" | cut -f1)"
