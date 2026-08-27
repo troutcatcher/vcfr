@@ -352,6 +352,24 @@ not silently grow AC/AN. One robustness difference: inputs carrying different
 REF alleles at the same position (malformed against any single reference) make
 bcftools abort mid-merge, while vcfr emits them as separate records.
 
+Imputed *sequence* data skews heavily toward rare variants, and that shape was
+tested separately: `examples/gen_beagle --af-spectrum seq` draws site allele
+frequencies log-uniformly on [2e-4, 0.5] — density proportional to 1/AF, the
+neutral spectrum behind resequencing panels such as 1000 Bull Genomes, verified
+at ~20% of sites below 0.1% AF and ~50% below 1% — with DR2 degrading with
+rarity the way imputation accuracy does. On a 3-way, 300-samples-each,
+150k-site merge of that shape (3.2GB of merged text, mostly hom-ref
+genotypes), merging to BGZF measured: bcftools `-Oz` 31.4–32.0s at 2.3 cores
+(145MB out) against vcfr `-Oz` 5.6–6.0s at 3.8 cores (160MB out) — **5.3–5.7x**
+— and at near-matched output size vcfr `-l 7` 11.1–11.2s (149MB, +2.8%),
+**2.8–2.9x**. Speed-first levels: `-l 1` 3.8s and `-l 0` 2.7–3.0s (~11x) at
++68% size. The gap is wider than the uniform-AF case's ~4x because rare-variant
+text is dominated by repeated `0|0:0.0x:…` runs: both the merge fast path and
+the compressor get cheaper per byte, and bcftools' float decode/re-render cost
+doesn't. Output verified as above — fixed columns and INFO identical after
+float normalisation, all 900 GT columns byte-identical, DS/GP numerically
+equal on sampled lines. Peak RSS: vcfr ~40MiB, bcftools ~13MiB.
+
 A GT-only variant of the same output (`examples/gen_beagle --gt-only`: phased
 `0|1` with no DS/GP and no DR2/AF/IMP — a phasing-only pipeline, or Beagle
 output already stripped of dosage) merges byte-for-byte identical to bcftools

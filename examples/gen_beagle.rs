@@ -12,6 +12,14 @@
 //! `--gt-only` drops DS/GP and the DR2/AF/IMP INFO fields, leaving FORMAT=GT
 //! alone — the shape of a phasing-only pipeline (Beagle run without genotype
 //! likelihoods, or output already stripped of dosage/probability fields).
+//!
+//! `--af-spectrum seq` draws site allele frequencies log-uniformly on
+//! [2e-4, 0.5] — density proportional to 1/AF, the neutral site-frequency
+//! spectrum that dominates resequencing panels such as the 1000 Bull Genomes
+//! data behind imputed bovine sequence. Roughly half of all sites land below
+//! 1% MAF, most genotypes are hom-ref, and DR2 degrades with rarity the way
+//! imputation accuracy does. The default `uniform` keeps the flat spectrum
+//! of the original fixtures.
 
 use std::io::{BufWriter, Write};
 
@@ -50,6 +58,14 @@ fn main() {
     let drop_pct: u64 = arg("--drop-pct", "0").parse().unwrap();
     let drop_seed: u64 = arg("--drop-seed", "7").parse().unwrap();
     let gt_only = std::env::args().any(|a| a == "--gt-only");
+    let seq_af = match arg("--af-spectrum", "uniform").as_str() {
+        "seq" => true,
+        "uniform" => false,
+        other => {
+            eprintln!("unknown --af-spectrum '{other}' (expected seq or uniform)");
+            std::process::exit(1);
+        }
+    };
 
     let mut out = BufWriter::with_capacity(1 << 20, std::io::stdout().lock());
     writeln!(out, "##fileformat=VCFv4.2").unwrap();
@@ -87,9 +103,32 @@ fn main() {
             let ref_i = (r & 3) as usize;
             let alt_i = (ref_i + 1 + ((r >> 8) % 3) as usize) % 4;
             // Site allele frequency shapes the cohort genotypes.
-            let af_pm = 1 + srng.below(500); // per-mille, 0.001..0.5
+            // AF in parts per 100k, so rare frequencies down to 2e-4 exist.
+            let af_e5: u64 = if seq_af {
+                // Log-uniform on [2e-4, 0.5]: density ~ 1/AF, the sequence
+                // spectrum. The panel floor (2e-4 ~ one carrier in 5000
+                // haplotypes) caps how rare an imputed site can be.
+                let u = srng.next() as f64 / u64::MAX as f64;
+                let af = 2e-4 * (0.5f64 / 2e-4).powf(u);
+                ((af * 1e5).round() as u64).clamp(20, 50000)
+            } else {
+                (1 + srng.below(500)) * 100 // flat on 0.001..0.5, as before
+            };
             let imputed = srng.below(100) < 85;
-            let dr2 = if imputed { 30 + srng.below(70) } else { 95 + srng.below(5) };
+            let dr2 = if !imputed {
+                95 + srng.below(5)
+            } else if !seq_af {
+                30 + srng.below(70)
+            } else if af_e5 < 100 {
+                // Imputation accuracy falls off with rarity.
+                25 + srng.below(45)
+            } else if af_e5 < 1000 {
+                40 + srng.below(50)
+            } else if af_e5 < 5000 {
+                60 + srng.below(38)
+            } else {
+                75 + srng.below(25)
+            };
 
             // Every srng draw happens before the keep check, or cohorts with
             // different drop seeds would desync and describe different sites.
@@ -113,7 +152,7 @@ fn main() {
             } else {
                 write!(
                     out,
-                    "chr{}\t{}\t{}\t{}\t{}\t.\tPASS\tDR2={}.{:02};AF={}.{:04}{}\tGT:DS:GP",
+                    "chr{}\t{}\t{}\t{}\t{}\t.\tPASS\tDR2={}.{:02};AF={}.{:05}{}\tGT:DS:GP",
                     c + 1,
                     pos,
                     id,
@@ -121,8 +160,8 @@ fn main() {
                     BASES[alt_i] as char,
                     dr2 / 100,
                     dr2 % 100,
-                    af_pm / 1000,
-                    af_pm % 1000 * 10,
+                    af_e5 / 100000,
+                    af_e5 % 100000,
                     if imputed { ";IMP" } else { "" },
                 )
                 .unwrap();
@@ -132,8 +171,8 @@ fn main() {
             for _ in 0..samples {
                 let g = gt_rng.next();
                 // Two haplotypes drawn at the site AF; everything phased.
-                let a = (g % 1000 < af_pm) as u32;
-                let b = ((g >> 20) % 1000 < af_pm) as u32;
+                let a = ((g % 100000) < af_e5) as u32;
+                let b = (((g >> 20) % 100000) < af_e5) as u32;
                 if gt_only {
                     write!(out, "\t{a}|{b}").unwrap();
                     continue;
