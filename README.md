@@ -151,6 +151,55 @@ moving bytes rather than by DEFLATE. Where DEFLATE dominates, `vcfr` sits at
 3.8-3.9 of 4 cores — within a few percent of the machine's limit — so the
 remaining lever there is the compression level, not the code.
 
+### Bigger inputs and thread scaling
+
+The same suite run on a 4x input — 500,000 sites x 1,000 samples, a 1.5 GB
+BGZF file holding ~10 GB of VCF text — reproduces every ratio above within
+noise (best of 2, same machine):
+
+| operation | bcftools | vcfr | speedup | cores b → v |
+| --- | ---: | ---: | ---: | :---: |
+| `view`: decompress to VCF | 77.73s | 3.11s | **25.0x** | 1.17 → 3.58 |
+| `view`: BGZF → BGZF re-compress | 109.50s | 46.57s | 2.35x † | 3.41 → 3.85 |
+| `view`: subset 50 of 1000 samples, BGZF | 50.79s | 8.79s | 5.77x † | 1.54 → 2.72 |
+| `view`: SNPs only, BGZF | 91.71s | 38.35s | 2.39x † | 3.36 → 3.85 |
+| `concat`: 4 parts → BGZF | 79.42s | 46.55s | 1.70x † | 3.68 → 3.87 |
+| `merge`: 3 cohorts → BGZF | 105.57s | 41.77s | 2.52x † | 3.22 → 3.85 |
+| `merge`: 3 cohorts → VCF | 94.89s | 6.19s | **15.3x** | 1.12 → 3.34 |
+
+Both tools scale linearly in input size (4.1x the data took each ~3.9x
+longer), doubling the sample width changes nothing, and the matched-ratio
+calibration lands in the same place (`-l 7`: 74.83s against 107.47s, 1.44x).
+Subsetting 50 of 1000 samples on this file is byte-identical to bcftools
+across all 500,000 records, as is merging the three 333-sample cohorts; and
+`merge`'s peak memory stays flat because its batches are bounded by bytes, not
+sites.
+
+Thread scaling, measured on the same 4x input (single runs, tools alternating;
+this machine has 4 physical cores, so 8 threads tests oversubscription, not
+scaling):
+
+| threads | bcftools `-Oz` | cores | vcfr `-Oz` | cores | head-to-head |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 297.9s | 1.27 | 176.4s | 0.99 | 1.69x |
+| 2 | 149.1s | 2.49 | 80.1s | 2.30 | 1.86x |
+| 4 | 104.9s | 3.50 | 45.9s | 3.93 | 2.29x |
+| 8 | 104.0s | 3.55 | 46.6s | 3.94 | 2.23x |
+
+Three things this table says. `vcfr`'s parallel efficiency at 4 threads is 96%
+(3.85x the single-thread time) against bcftools' 71%, so the head-to-head gap
+*widens* as threads are added — 1.69x at one, 2.29x at four. `vcfr`'s total CPU
+is flat across thread counts (176-185s), i.e. the parallelism is close to free.
+And oversubscribing 8 threads onto 4 cores costs neither tool anything. Whether
+the efficiency gap keeps widening past 4 cores is extrapolation — this machine
+cannot measure it.
+
+On the parse-bound path the thread column is one-sided: bcftools runs `-Ov` at
+1.16 cores whatever `--threads` is set to, while `vcfr` scales it (8.60s at
+one thread, 3.46s at four — 22x head-to-head on this file). The cores column
+also shows htslib's `--threads 1` really running 1.27 cores: htslib counts
+workers *beyond* the main thread.
+
 ### Notes on method
 
 Two failure modes cost real time in developing this table, and the harness now
