@@ -114,11 +114,34 @@ fn load8(data: &[u8], i: usize) -> u64 {
     unsafe { (data.as_ptr().add(i) as *const u64).read_unaligned() }.to_le()
 }
 
-/// Longest common prefix of data[a..] and data[b..], capped at MAX_MATCH,
-/// compared eight bytes at a time. The caller has already proven the first
-/// four bytes equal, so comparison starts there.
+/// True when the AVX2 paths should run: the CPU has AVX2 and the
+/// `VCFR_NO_SIMD` kill-switch (kept for A/B measurement) is unset. The
+/// answer is computed once; per-call cost is one atomic load.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn avx2_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VCFR_NO_SIMD").is_none() && std::arch::is_x86_feature_detected!("avx2")
+    })
+}
+
+/// Longest common prefix of data[a..] and data[b..], capped at MAX_MATCH.
+/// The caller has already proven the first four bytes equal, so comparison
+/// starts there. Dispatches to a 32-bytes-per-step AVX2 compare when the CPU
+/// has it, else eight bytes at a time via u64 XOR.
 #[inline]
 fn match_len(data: &[u8], a: usize, b: usize, limit: usize) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    if avx2_enabled() {
+        // SAFETY: AVX2 presence checked by avx2_enabled().
+        return unsafe { match_len_avx2(data, a, b, limit) };
+    }
+    match_len_swar(data, a, b, limit)
+}
+
+#[inline]
+fn match_len_swar(data: &[u8], a: usize, b: usize, limit: usize) -> usize {
     let max = limit.min(MAX_MATCH);
     let mut n = 4;
     while b + n + 8 <= data.len() && n + 8 <= max {
@@ -129,6 +152,34 @@ fn match_len(data: &[u8], a: usize, b: usize, limit: usize) -> usize {
             return (n + (d.trailing_zeros() / 8) as usize).min(max);
         }
         n += 8;
+    }
+    while n < max && data[a + n] == data[b + n] {
+        n += 1;
+    }
+    n
+}
+
+/// One 32-byte compare resolves most VCF matches in a single step: compare,
+/// movemask, invert, count trailing ones. `a < b` always, so only `b`'s side
+/// needs the buffer-end guard.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn match_len_avx2(data: &[u8], a: usize, b: usize, limit: usize) -> usize {
+    use std::arch::x86_64::*;
+    debug_assert!(a < b);
+    let max = limit.min(MAX_MATCH);
+    let mut n = 4usize;
+    while n < max && b + n + 32 <= data.len() {
+        let x = _mm256_loadu_si256(data.as_ptr().add(a + n) as *const __m256i);
+        let y = _mm256_loadu_si256(data.as_ptr().add(b + n) as *const __m256i);
+        let m = _mm256_movemask_epi8(_mm256_cmpeq_epi8(x, y)) as u32;
+        if m != u32::MAX {
+            return (n + (!m).trailing_zeros() as usize).min(max);
+        }
+        n += 32;
+    }
+    if n >= max {
+        return max;
     }
     while n < max && data[a + n] == data[b + n] {
         n += 1;

@@ -129,7 +129,10 @@ impl HighMatcher {
 
     /// Insert every position in `[*inserted, upto)`, exactly once each — a
     /// double insert would make a position its own chain predecessor and the
-    /// walk would spin on it.
+    /// walk would spin on it. (A batched AVX2 version of this — pshufb window
+    /// extraction, vectorized multiply — measured 25% slower than this scalar
+    /// loop: the serial head/prev stores dominate, and the common one-position
+    /// call paid a non-inlinable target_feature function call for nothing.)
     #[inline(always)]
     fn insert_upto(&mut self, data: &[u8], base: usize, upto: usize, inserted: &mut usize) {
         while *inserted < upto {

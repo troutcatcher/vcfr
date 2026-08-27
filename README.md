@@ -58,9 +58,24 @@ which is itself the honest headline: ~350 lines of safe-ish Rust matching a
 mature C library's mid levels point-for-point. End-to-end it does win one
 place: in `merge -Oz` at 4 threads, `--codec rust -l 4` finished in 9.0s at
 151MB where libdeflate `-l 7` took 11.2s for 149MB — the matched-ratio
-recommendation on rare-variant data. Neither encoder uses explicit SIMD: the
-hot loops are SWAR (unaligned 64-bit loads, XOR + trailing-zero count to
-extend matches); SIMD enters only through `crc32fast`'s hardware CRC path.
+recommendation on rare-variant data.
+
+Both encoders share one explicit-SIMD routine: match extension compares 32
+bytes per step with AVX2 (compare, movemask, count trailing ones), behind
+runtime detection with the 8-bytes-per-step SWAR loop (unaligned 64-bit
+loads, XOR + trailing-zero count) as the portable fallback. Measured
+interleaved with a same-binary kill-switch, it is worth ~8% on the fast
+encoder (756→811-854 MB/s) and ~7% on the high one, with byte-identical
+output — about 6% end-to-end on `merge -Oz --codec rust -l 4`, and nothing
+end-to-end at `-l 0`, where the merge pipeline rather than the encoder is
+the bottleneck. Two wider attempts measured worse and were dropped: an
+AVX-512BW 64-byte version (−8% — matches here are mostly shorter than 64
+bytes, so the extra probe width never pays), and batched AVX2 hashing for
+the chain matcher's interior insertion (−25% — the serial head/prev stores
+dominate, and the common one-position insert paid a non-inlinable
+`target_feature` call for nothing). Beyond that, SIMD enters through
+`crc32fast`'s hardware CRC path (~7 GB/s, so the BGZF checksum is
+effectively free).
 
 The thread budget
 is split between reading and writing according to which one is the bottleneck:

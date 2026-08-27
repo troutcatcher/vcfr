@@ -15,7 +15,7 @@ fn main() {
     println!("{} blocks, {:.0} MB", blocks.len(), mb);
 
     let quick = std::env::var("DEFL2_QUICK").is_ok();
-    let levels: &[i32] = if quick { &[4, 5, 6, 7] } else { &[1, 2, 3, 6, 7, 9, 12] };
+    let levels: &[i32] = if quick { &[6] } else { &[1, 2, 3, 6, 7, 9, 12] };
     for &level in levels {
         let t = Instant::now();
         let mut total = 0usize;
@@ -34,6 +34,28 @@ fn main() {
         );
     }
     if quick {
+        let mut m = deflate::Matcher::default();
+        let train_block = blocks[blocks.len() / 2];
+        let codes = deflate::CodeSet::train(train_block, &mut m);
+        let mut out = Vec::with_capacity(0x1_0000);
+        let mut best = f64::MAX;
+        let mut total = 0usize;
+        for _ in 0..4 {
+            let t = Instant::now();
+            total = 0;
+            for b in &blocks {
+                out.clear();
+                deflate::compress_into(&codes, &mut m, b, &mut out);
+                total += out.len();
+            }
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        println!(
+            "vcfr-rs      : {:>7.1} MB/s (best of 4)   ratio {:.3}   {} bytes",
+            mb / best,
+            data.len() as f64 / total as f64,
+            total
+        );
         let mut hm = deflate::HighMatcher::default();
         let mut out = Vec::with_capacity(0x1_0000);
         let mut best = f64::MAX;
