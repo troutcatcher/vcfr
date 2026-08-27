@@ -5,7 +5,7 @@ use std::io::Write;
 use crate::io::{detect_compression, open_raw_blocks, open_reader, Compression};
 use crate::vcf::header::{union_meta, Header};
 
-use super::{ignore_broken_pipe, resolve_threads, split_threads, OutputOpts};
+use super::{ignore_broken_pipe, resolve_threads, split_threads, write_or_broken_pipe, write_raw_block_or_broken_pipe, OutputOpts};
 
 #[derive(clap::Args, Debug)]
 pub struct ConcatArgs {
@@ -57,7 +57,7 @@ pub fn run(a: &ConcatArgs) -> Result<(), String> {
     let merged = union_meta(&headers);
     let mut buf = Vec::with_capacity(1 << 16);
     merged.write(&mut buf, &headers[0].samples, false);
-    w.write_all(&buf).map_err(|e| e.to_string())?;
+    write_or_broken_pipe(&mut w, &buf)?;
 
     let res = (|| -> std::io::Result<()> {
         for p in &inputs {
@@ -131,7 +131,7 @@ fn naive(inputs: &[String], a: &ConcatArgs, threads: usize) -> Result<(), String
             None => {
                 reference = Some(header.clone());
                 // The first file's header is the output header.
-                w.write_all(&header).map_err(|e| e.to_string())?;
+                write_or_broken_pipe(&mut w, &header)?;
             }
             Some(r) => {
                 if *r != header {
@@ -144,13 +144,13 @@ fn naive(inputs: &[String], a: &ConcatArgs, threads: usize) -> Result<(), String
         }
         // Re-encode the partial block, then pass the rest through untouched.
         if !tail.is_empty() {
-            w.write_all(&tail).map_err(|e| e.to_string())?;
+            write_or_broken_pipe(&mut w, &tail)?;
         }
         while let Some(b) = blocks.next_block().map_err(|e| format!("{p}: {e}"))? {
             if b.isize == 0 {
                 continue; // BGZF EOF marker
             }
-            w.write_raw_block(b.bytes).map_err(|e| e.to_string())?;
+            write_raw_block_or_broken_pipe(&mut w, b.bytes)?;
         }
     }
     ignore_broken_pipe(w.finish())

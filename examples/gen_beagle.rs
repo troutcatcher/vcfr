@@ -8,6 +8,10 @@
 //!
 //!   cargo run --release --example gen_beagle -- --sites 150000 --samples 300 \
 //!       --sample-prefix A --gt-seed 11 > cohortA.vcf
+//!
+//! `--gt-only` drops DS/GP and the DR2/AF/IMP INFO fields, leaving FORMAT=GT
+//! alone — the shape of a phasing-only pipeline (Beagle run without genotype
+//! likelihoods, or output already stripped of dosage/probability fields).
 
 use std::io::{BufWriter, Write};
 
@@ -45,6 +49,7 @@ fn main() {
     // Nonzero: omit a fraction of sites, for cohorts not sharing every marker.
     let drop_pct: u64 = arg("--drop-pct", "0").parse().unwrap();
     let drop_seed: u64 = arg("--drop-seed", "7").parse().unwrap();
+    let gt_only = std::env::args().any(|a| a == "--gt-only");
 
     let mut out = BufWriter::with_capacity(1 << 20, std::io::stdout().lock());
     writeln!(out, "##fileformat=VCFv4.2").unwrap();
@@ -53,12 +58,16 @@ fn main() {
     for c in 1..=contigs {
         writeln!(out, "##contig=<ID=chr{c}>").unwrap();
     }
-    writeln!(out, "##INFO=<ID=AF,Number=A,Type=Float,Description=\"Estimated ALT Allele Frequencies\">").unwrap();
-    writeln!(out, "##INFO=<ID=DR2,Number=A,Type=Float,Description=\"Dosage R-Squared: estimated squared correlation between estimated REF dose [P(RA) + 2*P(RR)] and true REF dose\">").unwrap();
-    writeln!(out, "##INFO=<ID=IMP,Number=0,Type=Flag,Description=\"Imputed marker\">").unwrap();
+    if !gt_only {
+        writeln!(out, "##INFO=<ID=AF,Number=A,Type=Float,Description=\"Estimated ALT Allele Frequencies\">").unwrap();
+        writeln!(out, "##INFO=<ID=DR2,Number=A,Type=Float,Description=\"Dosage R-Squared: estimated squared correlation between estimated REF dose [P(RA) + 2*P(RR)] and true REF dose\">").unwrap();
+        writeln!(out, "##INFO=<ID=IMP,Number=0,Type=Flag,Description=\"Imputed marker\">").unwrap();
+    }
     writeln!(out, "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">").unwrap();
-    writeln!(out, "##FORMAT=<ID=DS,Number=A,Type=Float,Description=\"estimated ALT dose [P(RA) + 2*P(AA)]\">").unwrap();
-    writeln!(out, "##FORMAT=<ID=GP,Number=G,Type=Float,Description=\"Estimated Genotype Probability\">").unwrap();
+    if !gt_only {
+        writeln!(out, "##FORMAT=<ID=DS,Number=A,Type=Float,Description=\"estimated ALT dose [P(RA) + 2*P(AA)]\">").unwrap();
+        writeln!(out, "##FORMAT=<ID=GP,Number=G,Type=Float,Description=\"Estimated Genotype Probability\">").unwrap();
+    }
     write!(out, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT").unwrap();
     for i in 0..samples {
         write!(out, "\t{prefix}{i:05}").unwrap();
@@ -93,27 +102,42 @@ fn main() {
                 continue;
             }
 
-            write!(
-                out,
-                "chr{}\t{}\t{}\t{}\t{}\t.\tPASS\tDR2={}.{:02};AF={}.{:04}{}\tGT:DS:GP",
-                c + 1,
-                pos,
-                if has_id { format!("rs{}", (c as u64 + 1) * 10_000_000 + pos) } else { ".".to_string() },
-                BASES[ref_i] as char,
-                BASES[alt_i] as char,
-                dr2 / 100,
-                dr2 % 100,
-                af_pm / 1000,
-                af_pm % 1000 * 10,
-                if imputed { ";IMP" } else { "" },
-            )
-            .unwrap();
+            let id = if has_id { format!("rs{}", (c as u64 + 1) * 10_000_000 + pos) } else { ".".to_string() };
+            if gt_only {
+                write!(
+                    out,
+                    "chr{}\t{}\t{}\t{}\t{}\t.\tPASS\t.\tGT",
+                    c + 1, pos, id, BASES[ref_i] as char, BASES[alt_i] as char,
+                )
+                .unwrap();
+            } else {
+                write!(
+                    out,
+                    "chr{}\t{}\t{}\t{}\t{}\t.\tPASS\tDR2={}.{:02};AF={}.{:04}{}\tGT:DS:GP",
+                    c + 1,
+                    pos,
+                    id,
+                    BASES[ref_i] as char,
+                    BASES[alt_i] as char,
+                    dr2 / 100,
+                    dr2 % 100,
+                    af_pm / 1000,
+                    af_pm % 1000 * 10,
+                    if imputed { ";IMP" } else { "" },
+                )
+                .unwrap();
+            }
+            let _ = dr2;
 
             for _ in 0..samples {
                 let g = gt_rng.next();
                 // Two haplotypes drawn at the site AF; everything phased.
                 let a = (g % 1000 < af_pm) as u32;
                 let b = ((g >> 20) % 1000 < af_pm) as u32;
+                if gt_only {
+                    write!(out, "\t{a}|{b}").unwrap();
+                    continue;
+                }
                 let dose = a + b;
                 // GP concentrated on the called genotype, Beagle-style rounding.
                 let noise = (g >> 40) % 6; // 0.00..0.05

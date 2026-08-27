@@ -92,3 +92,29 @@ pub fn ignore_broken_pipe(r: io::Result<()>) -> Result<(), String> {
         Err(e) => Err(e.to_string()),
     }
 }
+
+/// A `write_all` call site whose surrounding function returns `Result<...,
+/// String>` rather than an `io::Result` closure `ignore_broken_pipe` can wrap
+/// wholesale — merge's write points sit inside a closure that also carries
+/// stringified parse errors from unrelated sources, so the closure itself
+/// can't be `io::Result`. Checking the error kind here, before it is
+/// stringified and that information is lost, keeps a downstream `| head`
+/// a silent, successful exit instead of a spurious "Broken pipe" failure.
+pub fn write_or_broken_pipe(w: &mut crate::io::Writer, buf: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    match w.write_all(buf) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Same treatment for `Writer::write_raw_block`, used by `concat --naive`'s
+/// block-copy loop.
+pub fn write_raw_block_or_broken_pipe(w: &mut crate::io::Writer, block: Vec<u8>) -> Result<(), String> {
+    match w.write_raw_block(block) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
+}

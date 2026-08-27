@@ -352,6 +352,28 @@ not silently grow AC/AN. One robustness difference: inputs carrying different
 REF alleles at the same position (malformed against any single reference) make
 bcftools abort mid-merge, while vcfr emits them as separate records.
 
+A GT-only variant of the same output (`examples/gen_beagle --gt-only`: phased
+`0|1` with no DS/GP and no DR2/AF/IMP — a phasing-only pipeline, or Beagle
+output already stripped of dosage) merges byte-for-byte identical to bcftools
+with no normalisation needed, since there are no floats to re-render. It is
+faster still relative to bcftools on `-Oz` (2.6x, against ~4x for the DS/GP
+case — bcftools' own per-record overhead was heavier there and shrinks along
+with the payload) but *less* dramatically faster on plain output (13x against
+28-30x): with almost nothing per sample, the fixed per-site cost of grouping
+and allele-union bookkeeping is a bigger share of vcfr's own time, so bcftools'
+slower baseline has less absolute work left to save.
+
+Testing both variants surfaced a real bug, not a benchmark curiosity: `merge`
+and `concat --naive` could each leak a `Broken pipe` failure to stderr and a
+nonzero exit when piped into something that closes early (`| head`), because
+their write sites stringified the write error before `ignore_broken_pipe`
+could see its `ErrorKind`. `view` and `concat`'s main path were already
+correct — they route through an `io::Result` closure `ignore_broken_pipe`
+wraps wholesale — but `merge`'s write points sit inside a closure that also
+carries genuinely-stringified errors from parsing, so the whole closure
+couldn't be converted; each write site now checks for `BrokenPipe` before it
+is stringified instead. Regression-tested for all four commands.
+
 Known limits: REF padding is not performed, so records at the same position with
 different REF strings (`A→AT` in one file, `AT→A` in another) stay separate
 rather than being rewritten onto a common REF. `Number=G` values (such as `PL`)

@@ -231,6 +231,27 @@ for variant in undeclared declared; do
   check "merge AC/AN rule ($variant)" "$WORK/v.out" "$WORK/b.out"
 done
 
+# A downstream reader that closes early (`| head`) must exit vcfr cleanly: no
+# "Broken pipe" on stderr, no error exit code. merge and concat --naive each
+# had a write site whose io::Error was stringified before ignore_broken_pipe
+# could see its ErrorKind, so the pipe closing surfaced as a spurious failure.
+pipe_is_silent() { # pipe_is_silent <label> <cmd...>
+  local label="$1"; shift
+  "$@" 2>"$WORK/pipe.err" | head -c1 >/dev/null
+  local rc=$?
+  if [[ -s "$WORK/pipe.err" ]]; then
+    printf 'FAIL  %-34s stderr: %s\n' "$label" "$(cat "$WORK/pipe.err")"; fail=$((fail+1))
+  elif [[ $rc -ne 0 && $rc -ne 141 ]]; then
+    printf 'FAIL  %-34s pipeline exit %s\n' "$label" "$rc"; fail=$((fail+1))
+  else
+    printf 'ok    %s\n' "$label"; pass=$((pass+1))
+  fi
+}
+pipe_is_silent "view | head is silent"   $VCFR view "$WORK/all.vcf.gz"
+pipe_is_silent "concat | head is silent" $VCFR concat $PARTS
+pipe_is_silent "concat --naive | head is silent" $VCFR concat --naive -O z $PARTS
+pipe_is_silent "merge | head is silent"  $VCFR merge "$WORK/a.vcf.gz" "$WORK/b.vcf.gz"
+
 echo
 echo "passed: $pass   failed: $fail"
 [[ $fail -eq 0 ]]

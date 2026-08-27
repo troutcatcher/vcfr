@@ -3,14 +3,13 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::io::Write;
 
 use crate::io::{open_reader, Reader};
 use crate::pool::OrderedPool;
 use crate::vcf::header::{union_meta, Header, Number};
 use crate::vcf::record::*;
 
-use super::{ignore_broken_pipe, merge_threads, resolve_threads, OutputOpts};
+use super::{ignore_broken_pipe, merge_threads, resolve_threads, write_or_broken_pipe, OutputOpts};
 
 #[derive(clap::Args, Debug)]
 pub struct MergeArgs {
@@ -430,7 +429,7 @@ pub fn run(a: &MergeArgs) -> Result<(), String> {
     let mut w = a.out.writer(wthreads)?;
     let mut buf = Vec::with_capacity(1 << 16);
     merged_hdr.write(&mut buf, &out_samples, false);
-    w.write_all(&buf).map_err(|e| e.to_string())?;
+    write_or_broken_pipe(&mut w, &buf)?;
 
     let rules = InfoRules::parse(&a.info_rules)?;
     let mode = MergeMode::parse(&a.merge)?;
@@ -522,7 +521,7 @@ pub fn run(a: &MergeArgs) -> Result<(), String> {
                         })
                         .collect();
                     emit(&mems, n_out, opts, &merged_hdr, &rules, &mut ctx, &mut buf)?;
-                    w.write_all(&buf).map_err(|e| e.to_string())?;
+                    write_or_broken_pipe(&mut w, &buf)?;
                 }
             }
             for &i in &members {
@@ -949,7 +948,7 @@ fn drain_pool(
     while pool.outstanding() >= pool.capacity() || (until_empty && pool.outstanding() > 0) {
         match pool.next() {
             Some(Ok(mut f)) => {
-                w.write_all(&f.bytes).map_err(|e| e.to_string())?;
+                write_or_broken_pipe(w, &f.bytes)?;
                 free.append(&mut f.spent);
                 free_out.push(f.bytes);
             }
