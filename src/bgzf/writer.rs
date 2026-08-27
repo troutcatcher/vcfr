@@ -23,7 +23,12 @@ impl<W: Write> BgzfWriter<W> {
         let level = level.clamp(1, 12) as i32;
         BgzfWriter {
             inner,
-            pool: (workers >= 1).then(|| OrderedPool::new(workers, workers * 3)),
+            // Depth is blocks in flight between the feeding thread and the
+            // deflate workers. At 3 per worker (~0.75 MiB on 4 workers) any
+            // hiccup on the feeding side starves them: measured 2.6 of 4 cores
+            // at level 1 and 3.7 at level 6. At 16 per worker (~4 MiB) both
+            // reach ~3.85; 48 buys nothing more.
+            pool: (workers >= 1).then(|| OrderedPool::new(workers, workers * 16)),
             inline: (workers == 0).then(|| {
                 libdeflater::Compressor::new(
                     libdeflater::CompressionLvl::new(level).expect("valid compression level"),
