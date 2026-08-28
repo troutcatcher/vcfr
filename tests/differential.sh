@@ -255,6 +255,31 @@ pipe_is_silent() { # pipe_is_silent <label> <cmd...>
     printf 'ok    %s\n' "$label"; pass=$((pass+1))
   fi
 }
+# ------------------------------------------- wide-cohort block splicing ----
+# At >=16384 samples merge -Oz splices input blocks through uncompressed;
+# the decompressed output must be byte-identical to the non-spliced path and
+# htslib must read the mixed-provenance block stream.
+for w in wa wb; do
+  seed=$(( $(echo $w | cksum | cut -d' ' -f1) % 1000 ))
+  cargo run --release --quiet --example gen_beagle -- --sites 12 --samples 20000 \
+    --af-spectrum seq --render beagle --sample-prefix ${w}_ --gt-seed $seed \
+    | bgzip -c > "$WORK/$w.wide.vcf.gz"
+done
+$VCFR merge -O z --threads 4 -o "$WORK/wide.sp.vcf.gz" "$WORK/wa.wide.vcf.gz" "$WORK/wb.wide.vcf.gz"
+VCFR_NO_SPLICE=1 $VCFR merge -O z --threads 4 -o "$WORK/wide.nosp.vcf.gz" "$WORK/wa.wide.vcf.gz" "$WORK/wb.wide.vcf.gz"
+if cmp -s <(bgzip -dc "$WORK/wide.sp.vcf.gz") <(bgzip -dc "$WORK/wide.nosp.vcf.gz"); then
+  echo "ok    wide merge: spliced output identical"; pass=$((pass+1))
+else
+  echo "FAIL  wide merge: spliced output differs"; fail=$((fail+1))
+fi
+bcftools view "$WORK/wide.sp.vcf.gz" > "$WORK/v.out" 2>"$WORK/v.err"
+if [[ -s "$WORK/v.out" && ! -s "$WORK/v.err" ]]; then
+  echo "ok    wide merge: htslib reads spliced BGZF"; pass=$((pass+1))
+else
+  echo "FAIL  wide merge: htslib rejects spliced BGZF: $(cat "$WORK/v.err")"; fail=$((fail+1))
+fi
+pipe_is_silent "wide merge | head is silent" $VCFR merge -O z --threads 4 "$WORK/wa.wide.vcf.gz" "$WORK/wb.wide.vcf.gz"
+
 pipe_is_silent "view | head is silent"   $VCFR view "$WORK/all.vcf.gz"
 pipe_is_silent "concat | head is silent" $VCFR concat $PARTS
 pipe_is_silent "concat --naive | head is silent" $VCFR concat --naive -O z $PARTS

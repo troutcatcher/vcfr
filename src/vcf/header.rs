@@ -66,27 +66,9 @@ impl Header {
         let mut h = Header::default();
         let mut saw_chrom = false;
         while r.advance()? {
-            let line = r.line();
-            if line.is_empty() {
-                continue;
-            }
-            if line.starts_with(b"##") {
-                h.push_meta(line.to_vec());
-            } else if line.starts_with(b"#CHROM") {
-                let cols: Vec<&[u8]> = line.split(|&b| b == b'\t').collect();
-                if cols.len() > 8 {
-                    h.has_format_col = cols[8] == b"FORMAT";
-                }
-                for c in cols.iter().skip(9) {
-                    h.samples.push(String::from_utf8_lossy(c).into_owned());
-                }
+            if h.feed_line(r.line())? {
                 saw_chrom = true;
                 break;
-            } else {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "record found before the #CHROM header line",
-                ));
             }
         }
         if !saw_chrom {
@@ -96,6 +78,33 @@ impl Header {
             ));
         }
         Ok(h)
+    }
+
+    /// Digest one header line; returns `true` once the `#CHROM` line has been
+    /// consumed and the header is complete. Shared by `read` and readers that
+    /// produce lines through a different interface.
+    pub fn feed_line(&mut self, line: &[u8]) -> io::Result<bool> {
+        if line.is_empty() {
+            return Ok(false);
+        }
+        if line.starts_with(b"##") {
+            self.push_meta(line.to_vec());
+        } else if line.starts_with(b"#CHROM") {
+            let cols: Vec<&[u8]> = line.split(|&b| b == b'\t').collect();
+            if cols.len() > 8 {
+                self.has_format_col = cols[8] == b"FORMAT";
+            }
+            for c in cols.iter().skip(9) {
+                self.samples.push(String::from_utf8_lossy(c).into_owned());
+            }
+            return Ok(true);
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "record found before the #CHROM header line",
+            ));
+        }
+        Ok(false)
     }
 
     pub fn push_meta(&mut self, line: Vec<u8>) {

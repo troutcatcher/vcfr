@@ -4,7 +4,8 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::io::{open_reader, Reader};
+use crate::bgzf::spliced::{InteriorBlock, SplicedLineReader};
+use crate::io::{detect_compression, open_reader, Compression, Reader};
 use crate::pool::OrderedPool;
 use crate::vcf::header::{union_meta, Header, Number};
 use crate::vcf::record::*;
@@ -196,10 +197,38 @@ impl RankMap {
     }
 }
 
+/// Merge's input reader: the ordinary line reader, or the block-keeping one
+/// used when both ends are BGZF and interior blocks can be spliced through.
+enum MReader {
+    Plain(Reader),
+    Spliced(SplicedLineReader),
+}
+
+impl MReader {
+    fn read_header(&mut self) -> Result<Header, String> {
+        match self {
+            MReader::Plain(r) => Header::read(r).map_err(|e| e.to_string()),
+            MReader::Spliced(s) => {
+                let mut h = Header::default();
+                loop {
+                    if !s.advance()? {
+                        return Err("missing #CHROM header line".into());
+                    }
+                    if h.feed_line(s.line()).map_err(|e| e.to_string())? {
+                        return Ok(h);
+                    }
+                }
+            }
+        }
+    }
+}
+
 struct Stream {
     path: String,
-    rdr: Reader,
+    rdr: MReader,
     line: Vec<u8>,
+    /// Compressed blocks wholly inside `line`, when the reader keeps them.
+    blocks: Vec<InteriorBlock>,
     rec: Record,
     valid: bool,
     rank: usize,
@@ -217,17 +246,35 @@ impl Stream {
 
     fn advance(&mut self, ranks: &mut RankMap) -> Result<(), String> {
         loop {
-            let more = self.rdr.advance().map_err(|e| format!("{}: {e}", self.path))?;
+            let more = match &mut self.rdr {
+                MReader::Plain(r) => r.advance().map_err(|e| format!("{}: {e}", self.path))?,
+                MReader::Spliced(s) => s.advance().map_err(|e| format!("{}: {e}", self.path))?,
+            };
             if !more {
                 self.valid = false;
                 return Ok(());
             }
-            let l = self.rdr.line();
-            if l.is_empty() || l[0] == b'#' {
-                continue;
+            match &mut self.rdr {
+                MReader::Plain(r) => {
+                    let l = r.line();
+                    if l.is_empty() || l[0] == b'#' {
+                        continue;
+                    }
+                    self.line.clear();
+                    self.line.extend_from_slice(l);
+                    self.blocks.clear();
+                }
+                MReader::Spliced(s) => {
+                    let l = s.line();
+                    if l.is_empty() || l[0] == b'#' {
+                        continue;
+                    }
+                    // Take the line and its interior blocks; offsets in the
+                    // blocks refer to exactly this text.
+                    self.line = s.take_line();
+                    self.blocks = s.take_blocks();
+                }
             }
-            self.line.clear();
-            self.line.extend_from_slice(l);
             // The main thread only orders and groups records, which needs
             // nothing past FORMAT. Splitting the sample columns is left to
             // whoever formats the record, so this scans a few dozen bytes
@@ -354,12 +401,39 @@ pub fn run(a: &MergeArgs) -> Result<(), String> {
     // the serial bottleneck, so every input gets its own inflation worker.
     let (per_file, wthreads) = merge_threads(threads, inputs.len(), a.out.bgzf()?);
 
+    // With BGZF on both ends, a compressed block lying wholly inside a line's
+    // verbatim-copied sample run is equally valid in the output, so the
+    // readers keep raw blocks and emit splices them past the deflate stage.
+    // That only pays when lines actually span blocks: the block-keeping
+    // reader hands over whole lines through a channel, and at a few KB per
+    // line that per-line overhead measured 2-3x slower than the chunked
+    // reader, while at ~16k samples a GT:DS:GP line is already several
+    // blocks long. So each file is upgraded only when its header shows a
+    // cohort wide enough. VCFR_NO_SPLICE exists for A/B measurement and
+    // differential testing.
+    const SPLICE_MIN_SAMPLES: usize = 16384;
+    let want_splice = a.out.bgzf()?
+        && std::env::var_os("VCFR_NO_SPLICE").is_none()
+        && inputs
+            .iter()
+            .all(|p| matches!(detect_compression(p), Ok(Compression::Bgzf)));
+
     let mut headers = Vec::with_capacity(inputs.len());
     let mut readers = Vec::with_capacity(inputs.len());
+    let mut splice_mode = false;
     for p in &inputs {
         let mut r = open_reader(p, per_file).map_err(|e| e.to_string())?;
-        headers.push(Header::read(&mut r).map_err(|e| format!("{p}: {e}"))?);
-        readers.push(r);
+        let h = Header::read(&mut r).map_err(|e| format!("{p}: {e}"))?;
+        if want_splice && h.samples.len() >= SPLICE_MIN_SAMPLES {
+            drop(r);
+            let mut sr = MReader::Spliced(SplicedLineReader::open(p).map_err(|e| e.to_string())?);
+            sr.read_header().map_err(|e| format!("{p}: {e}"))?;
+            readers.push(sr);
+            splice_mode = true;
+        } else {
+            readers.push(MReader::Plain(r));
+        }
+        headers.push(h);
     }
 
     // bcftools adds INFO/AN and INFO/AC only when an input header declares
@@ -415,6 +489,7 @@ pub fn run(a: &MergeArgs) -> Result<(), String> {
             path: p.clone(),
             rdr: r,
             line: Vec::with_capacity(1 << 12),
+            blocks: Vec::new(),
             rec: Record::new(),
             valid: false,
             rank: 0,
@@ -510,6 +585,13 @@ pub fn run(a: &MergeArgs) -> Result<(), String> {
                     for (k, &i) in g.iter().enumerate() {
                         full[k].split(&streams[i].line);
                     }
+                    // Take each member's interior blocks first (a mutable
+                    // borrow), then borrow the lines for the members.
+                    let mut blk_lists: Vec<Vec<InteriorBlock>> = if splice_mode {
+                        g.iter().map(|&i| std::mem::take(&mut streams[i].blocks)).collect()
+                    } else {
+                        Vec::new()
+                    };
                     let mems: Vec<Member> = g
                         .iter()
                         .enumerate()
@@ -520,8 +602,15 @@ pub fn run(a: &MergeArgs) -> Result<(), String> {
                             n_samples: streams[i].n_samples,
                         })
                         .collect();
-                    emit(&mems, n_out, opts, &merged_hdr, &rules, &mut ctx, &mut buf)?;
-                    write_or_broken_pipe(&mut w, &buf)?;
+                    if splice_mode {
+                        emit_spliced(
+                            &mems, &mut blk_lists, n_out, opts, &merged_hdr, &rules, &mut ctx,
+                            &mut buf, &mut w,
+                        )?;
+                    } else {
+                        emit(&mems, n_out, opts, &merged_hdr, &rules, &mut ctx, &mut buf)?;
+                        write_or_broken_pipe(&mut w, &buf)?;
+                    }
                 }
             }
             for &i in &members {
@@ -547,8 +636,20 @@ struct EmitOpts {
     missing_to_ref: bool,
 }
 
+/// Site-level facts derived while writing the fixed columns, needed again
+/// when the sample columns are written.
+struct EmitPlan {
+    uniform: bool,
+    n_alt: usize,
+    gt_slot: Option<usize>,
+    n_keys: usize,
+    ploidy: usize,
+}
+
+/// Write everything through the FORMAT column into `out` and return the plan
+/// for the sample columns.
 #[allow(clippy::too_many_arguments)]
-fn emit(
+fn emit_head(
     members: &[Member],
     n_out: usize,
     opts: EmitOpts,
@@ -556,7 +657,7 @@ fn emit(
     rules: &InfoRules,
     ctx: &mut Ctx,
     out: &mut Vec<u8>,
-) -> Result<(), String> {
+) -> Result<EmitPlan, String> {
     let first = &members[0];
 
     // Almost always every input describes the site identically. When it does,
@@ -776,51 +877,148 @@ fn emit(
                 out.extend_from_slice(k);
             }
         }
+    }
+    Ok(EmitPlan { uniform, n_alt, gt_slot, n_keys, ploidy })
+}
 
+/// Write one member's sample columns: the whole-run memcpy when every column
+/// passes through verbatim, otherwise the per-sample path.
+fn write_member_cols(m: &Member, mi: usize, plan: &EmitPlan, ctx: &Ctx, hdr: &Header, out: &mut Vec<u8>) {
+    let passthrough = ctx.identity[mi]
+        && m.ncols() > COL_FORMAT
+        && (plan.uniform || format_matches(m.get(COL_FORMAT), &ctx.fmt_keys));
+    if passthrough && m.ncols() == FIRST_SAMPLE + m.n_samples && m.n_samples > 0 {
+        // Every sample column is reproduced verbatim, so copy the whole
+        // run of them, tab separators included, in one memcpy.
+        out.push(b'\t');
+        out.extend_from_slice(m.rec.span(m.line, FIRST_SAMPLE, m.ncols() - 1));
+    } else {
+        for j in 0..m.n_samples {
+            let col = FIRST_SAMPLE + j;
+            let field: &[u8] = if col < m.ncols() { m.get(col) } else { b"." };
+            out.push(b'\t');
+            if passthrough {
+                out.extend_from_slice(field);
+            } else {
+                write_sample(
+                    out,
+                    field,
+                    &ctx.fmt_keys,
+                    &ctx.key_pos[mi],
+                    &ctx.maps[mi],
+                    ctx.identity[mi],
+                    plan.n_alt,
+                    hdr,
+                    plan.ploidy,
+                );
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit(
+    members: &[Member],
+    n_out: usize,
+    opts: EmitOpts,
+    hdr: &Header,
+    rules: &InfoRules,
+    ctx: &mut Ctx,
+    out: &mut Vec<u8>,
+) -> Result<(), String> {
+    let plan = emit_head(members, n_out, opts, hdr, rules, ctx, out)?;
+    if n_out > 0 {
         let mut next_out_sample = 0usize;
         for (mi, m) in members.iter().enumerate() {
             while next_out_sample < m.sample_off {
-                push_missing(out, n_keys, gt_slot, ploidy, opts.missing_to_ref);
+                push_missing(out, plan.n_keys, plan.gt_slot, plan.ploidy, opts.missing_to_ref);
                 next_out_sample += 1;
             }
-            let passthrough = ctx.identity[mi]
-                && m.ncols() > COL_FORMAT
-                && (uniform || format_matches(m.get(COL_FORMAT), &ctx.fmt_keys));
-            if passthrough && m.ncols() == FIRST_SAMPLE + m.n_samples && m.n_samples > 0 {
-                // Every sample column is reproduced verbatim, so copy the whole
-                // run of them, tab separators included, in one memcpy.
-                out.push(b'\t');
-                out.extend_from_slice(m.rec.span(m.line, FIRST_SAMPLE, m.ncols() - 1));
-            } else {
-                for j in 0..m.n_samples {
-                    let col = FIRST_SAMPLE + j;
-                    let field: &[u8] = if col < m.ncols() { m.get(col) } else { b"." };
-                    out.push(b'\t');
-                    if passthrough {
-                        out.extend_from_slice(field);
-                    } else {
-                        write_sample(
-                            out,
-                            field,
-                            &ctx.fmt_keys,
-                            &ctx.key_pos[mi],
-                            &ctx.maps[mi],
-                            ctx.identity[mi],
-                            n_alt,
-                            hdr,
-                            ploidy,
-                        );
-                    }
-                }
-            }
+            write_member_cols(m, mi, &plan, ctx, hdr, out);
             next_out_sample += m.n_samples;
         }
         while next_out_sample < n_out {
-            push_missing(out, n_keys, gt_slot, ploidy, opts.missing_to_ref);
+            push_missing(out, plan.n_keys, plan.gt_slot, plan.ploidy, opts.missing_to_ref);
             next_out_sample += 1;
         }
     }
     out.push(b'\n');
+    Ok(())
+}
+
+/// `emit`, but the output goes to a BGZF writer and any input block lying
+/// wholly inside a member's verbatim-copied sample run is spliced through
+/// still compressed. Buffered text is flushed before each splice, so the
+/// stream interleaves (possibly short) freshly-deflated blocks with blocks
+/// copied from the inputs; both are ordinary BGZF members and any reader
+/// accepts the mix. The decompressed output is byte-identical to `emit`'s.
+#[allow(clippy::too_many_arguments)]
+fn emit_spliced(
+    members: &[Member],
+    blocks: &mut [Vec<InteriorBlock>],
+    n_out: usize,
+    opts: EmitOpts,
+    hdr: &Header,
+    rules: &InfoRules,
+    ctx: &mut Ctx,
+    buf: &mut Vec<u8>,
+    w: &mut crate::io::Writer,
+) -> Result<(), String> {
+    let plan = emit_head(members, n_out, opts, hdr, rules, ctx, buf)?;
+    if n_out > 0 {
+        let mut next_out_sample = 0usize;
+        for (mi, m) in members.iter().enumerate() {
+            while next_out_sample < m.sample_off {
+                push_missing(buf, plan.n_keys, plan.gt_slot, plan.ploidy, opts.missing_to_ref);
+                next_out_sample += 1;
+            }
+            // Splicing applies exactly where the whole-run memcpy does.
+            let whole_run = ctx.identity[mi]
+                && m.ncols() > COL_FORMAT
+                && (plan.uniform || format_matches(m.get(COL_FORMAT), &ctx.fmt_keys))
+                && m.ncols() == FIRST_SAMPLE + m.n_samples
+                && m.n_samples > 0;
+            let (a, b) = if whole_run {
+                m.rec.span_range(m.line.len(), FIRST_SAMPLE, m.ncols() - 1)
+            } else {
+                (0, 0)
+            };
+            let can_splice = whole_run
+                && blocks[mi].iter().any(|k| k.line_off >= a && k.end() <= b);
+            if can_splice {
+                buf.push(b'\t');
+                let mut cur = a;
+                for k in blocks[mi].iter_mut() {
+                    if k.line_off < a || k.end() > b {
+                        continue;
+                    }
+                    debug_assert!(k.line_off >= cur);
+                    buf.extend_from_slice(&m.line[cur..k.line_off]);
+                    if !buf.is_empty() {
+                        write_or_broken_pipe(w, buf)?;
+                        buf.clear();
+                    }
+                    match w.splice_block(std::mem::take(&mut k.raw)) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+                        Err(e) => return Err(e.to_string()),
+                    }
+                    cur = k.end();
+                }
+                buf.extend_from_slice(&m.line[cur..b]);
+            } else {
+                write_member_cols(m, mi, &plan, ctx, hdr, buf);
+            }
+            next_out_sample += m.n_samples;
+        }
+        while next_out_sample < n_out {
+            push_missing(buf, plan.n_keys, plan.gt_slot, plan.ploidy, opts.missing_to_ref);
+            next_out_sample += 1;
+        }
+    }
+    buf.push(b'\n');
+    write_or_broken_pipe(w, buf)?;
+    buf.clear();
     Ok(())
 }
 

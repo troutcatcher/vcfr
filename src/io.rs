@@ -113,6 +113,18 @@ impl Writer {
         })
     }
 
+    /// Splice a raw BGZF block through the compression pipeline in order.
+    /// Only valid on a BGZF sink.
+    pub fn splice_block(&mut self, block: Vec<u8>) -> io::Result<()> {
+        match self {
+            Writer::Bgzf(w) => w.splice_block(block),
+            Writer::Plain(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "block splicing requires BGZF output",
+            )),
+        }
+    }
+
     /// Append a raw BGZF block. Only valid on a BGZF sink.
     pub fn write_raw_block(&mut self, block: Vec<u8>) -> io::Result<()> {
         match self {

@@ -424,6 +424,30 @@ with the payload) but *less* dramatically faster on plain output (13x against
 and allele-union bookkeeping is a bigger share of vcfr's own time, so bcftools'
 slower baseline has less absolute work left to save.
 
+On very wide cohorts, `merge -Oz` skips most of the deflate work entirely by
+**block splicing** (`src/bgzf/spliced.rs`): a 2.2M-sample line is ~30MB of
+text spanning hundreds of BGZF blocks, and any input block whose uncompressed
+content contains no newline lies wholly inside one line — if that stretch of
+the line is copied into the output verbatim (the uniform-site fast path),
+the *compressed* block is equally valid output, since BGZF blocks are
+self-contained gzip members with their own CRCs and records need not align
+to block boundaries. The reader keeps the raw blocks alongside each line,
+and emit flushes its buffered text as a (possibly short) block and splices
+the input blocks through the ordered writer pool untouched; only the
+boundary blocks — fixed columns at the head, the newline at the tail — are
+re-deflated. Measured on a 10-batch × 220k-sample merge (2.2M samples out,
+~44MB lines, ~670 blocks per line): ~1.8x less CPU and 20-40% less wall
+than the non-spliced path, output *smaller* (spliced blocks keep the
+input's compression, closing the usual size gap with bcftools to ~0.3%),
+decompressed output byte-identical, and htslib reads and indexes the mixed
+stream. The spliced reader hands whole lines over a channel, which costs
+too much per line on narrow data — measured 2-3x slower at 300 samples —
+so each input engages it only when its header shows ≥16384 samples; below
+that the chunked reader path is unchanged. `VCFR_NO_SPLICE=1` disables it
+for measurement. One semantic note: spliced output blocks carry whatever
+compression level the *input* was written at; only re-encoded boundary
+blocks honour `-l`.
+
 Testing both variants surfaced a real bug, not a benchmark curiosity: `merge`
 and `concat --naive` could each leak a `Broken pipe` failure to stderr and a
 nonzero exit when piped into something that closes early (`| head`), because

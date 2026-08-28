@@ -174,6 +174,23 @@ impl<W: Write> BgzfWriter<W> {
         self.inner.write_all(&block)
     }
 
+    /// Splice an already-formed BGZF block into the stream *through* the
+    /// ordered pool: pending buffered text is flushed as its own (possibly
+    /// short) block, then the raw block travels as an identity job, keeping
+    /// its place among in-flight deflate jobs without stalling them the way
+    /// `write_raw_block`'s full drain does. Used by merge's block splicing,
+    /// which does this hundreds of times per output line.
+    pub fn splice_block(&mut self, block: Vec<u8>) -> io::Result<()> {
+        self.flush_block()?;
+        match &mut self.pool {
+            Some(pool) => {
+                pool.submit(move || block);
+                self.drain(false)
+            }
+            None => self.inner.write_all(&block),
+        }
+    }
+
     /// Finish the stream: flush pending data and append the BGZF EOF block.
     pub fn finish(&mut self) -> io::Result<()> {
         if self.finished {

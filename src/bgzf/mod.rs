@@ -6,6 +6,7 @@
 //! verbatim without touching the deflate stream at all.
 
 pub mod reader;
+pub mod spliced;
 pub mod writer;
 
 use std::io::{self, Read};

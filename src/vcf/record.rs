@@ -77,6 +77,14 @@ impl Record {
         &line[s..e.min(line.len())]
     }
 
+    /// Byte range of `span(line, i, j)` within the line, for callers that
+    /// need offsets rather than the slice (block splicing).
+    pub fn span_range(&self, line_len: usize, i: usize, j: usize) -> (usize, usize) {
+        let s = self.starts[i] as usize;
+        let e = ((self.starts[j + 1] - 1) as usize).min(line_len);
+        (s, e)
+    }
+
 }
 
 #[inline]
