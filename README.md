@@ -2,9 +2,9 @@
 
 A fast VCF toolkit: **merge**, **concat**, and **subset** VCF files.
 
-`vcfr` does the handful of VCF operations that dominate real pipelines, and does
-them quickly. Output is verified byte-for-byte against `bcftools` — the test
-suite in `tests/differential.sh` runs 41 paired invocations and requires the two
+`vcfr` does the handful of VCF operations that dominate real pipelines, and
+does them quickly. Output is verified against `bcftools` — the differential
+suite in `tests/differential.sh` runs 58 paired checks and requires the two
 tools to agree exactly.
 
 ```
@@ -13,296 +13,188 @@ vcfr concat [--naive] part1.vcf.gz part2.vcf.gz ...
 vcfr merge  cohortA.vcf.gz cohortB.vcf.gz ...
 ```
 
-## Why it is fast
-
-**Nothing is parsed until it is needed.** A record is indexed by scanning for
-tab positions; the fields a command doesn't touch are never looked at. A record
-that survives a filter unchanged costs one `memchr` scan and one `write_all` —
-no allele decoding, no INFO parsing, no per-record allocation. Genotypes are
-only decoded when a command actually needs them (recomputing `AC`/`AN`, or
-renumbering alleles during a merge).
-
-**BGZF is (de)compressed on every core.** BGZF blocks are self-contained, so
-inflation and deflation are farmed out to a worker pool and reassembled in
-order (`src/pool.rs`). `libdeflate` does the actual codec work. It is much
-faster than zlib at inflating; at deflating it is faster mainly because its
-levels are calibrated differently, so see the compression note below the
-benchmark table before reading anything into the `-O z` numbers.
-
-**Level 0 is vcfr's own DEFLATE encoder** (`src/deflate`), written for this
-workload. libdeflate must treat every 64 KiB block as unknown data — count
-symbol frequencies, build Huffman codes, then emit, per block. VCF blocks all
-look alike, so `-l 0` trains one canonical code set on an early block and
-compresses every block in a single greedy pass with no counting and no code
-construction, probing with a 6-byte hash because VCF text is saturated with
-4-byte collisions (`\t0/0`, `:12,`) that waste 4-byte probes. On real VCF text
-it beats libdeflate level 1 on both axes — 240-262 MB/s against 227-235 at a
-better ratio (4.13-4.15 against 3.95-3.97) — and reaches 98-99% of level 2's
-ratio at roughly twice level 2's speed. The output is ordinary DEFLATE:
-htslib reads and indexes it, `gzip -t` accepts it, and the test suite
-round-trips every stream through libdeflate's own decoder. Levels 1-12 remain
-libdeflate by default; decompression is libdeflate throughout. On data unlike
-its training block the encoder stays correct — codes are smoothed so every
-byte value can be emitted, and a stored-block fallback bounds the
-incompressible case — it just compresses less well.
-
-**`--codec rust` extends the pure-Rust range to higher ratios**
-(`src/deflate/high.rs`): levels 1-6 route to a second built-in encoder that
-tokenizes each block with a lazy hash-chain matcher (chain depth 8→256 by
-level) and then builds *exact* per-block Huffman codes from that block's own
-token counts — the opposite trade to `-l 0`'s preset codes. Measured on
-64 KiB blocks of real merged VCF against libdeflate in the same run, it
-traces libdeflate's speed/ratio frontier from about l4 to l9 rather than
-beating it (rust-3 ≈ l6's point, rust-4 sits between l6 and l7, rust-6 ≈ l9),
-which is itself the honest headline: ~350 lines of safe-ish Rust matching a
-mature C library's mid levels point-for-point. End-to-end it does win one
-place: in `merge -Oz` at 4 threads, `--codec rust -l 4` finished in 9.0s at
-151MB where libdeflate `-l 7` took 11.2s for 149MB — the matched-ratio
-recommendation on rare-variant data.
-
-Both encoders share one explicit-SIMD routine: match extension compares 32
-bytes per step with AVX2 (compare, movemask, count trailing ones), behind
-runtime detection with the 8-bytes-per-step SWAR loop (unaligned 64-bit
-loads, XOR + trailing-zero count) as the portable fallback. Measured
-interleaved with a same-binary kill-switch, it is worth ~8% on the fast
-encoder (756→811-854 MB/s) and ~7% on the high one, with byte-identical
-output — about 6% end-to-end on `merge -Oz --codec rust -l 4`, and nothing
-end-to-end at `-l 0`, where the merge pipeline rather than the encoder is
-the bottleneck. Two wider attempts measured worse and were dropped: an
-AVX-512BW 64-byte version (−8% — matches here are mostly shorter than 64
-bytes, so the extra probe width never pays), and batched AVX2 hashing for
-the chain matcher's interior insertion (−25% — the serial head/prev stores
-dominate, and the common one-position insert paid a non-inlinable
-`target_feature` call for nothing). Beyond that, SIMD enters through
-`crc32fast`'s hardware CRC path (~7 GB/s, so the BGZF checksum is
-effectively free).
-
-The thread budget
-is split between reading and writing according to which one is the bottleneck:
-deflating costs several times more than inflating, so with `-O z` most threads
-go to the writer, and with `-O v` they all go to the reader. `--threads N`
-counts worker threads, so `--threads 1` really is a single thread — the codec
-runs inline rather than handing work to a pool of one.
-
-**`merge` does as little as possible on the thread that orders records.**
-Combining k sorted streams is inherently serial, so that thread is the
-bottleneck: it must not also inflate its inputs (every input gets its own
-inflation worker), and it must not assemble output records (those go to a pool
-of formatting workers, reordered on the way out). Record lines are *moved* into
-a batch rather than copied — a stream is about to overwrite its buffer on the
-next advance anyway, so it takes a recycled one and hands the old one over —
-and splitting a line into columns happens on whichever worker formats it. What
-is left on the ordering thread is a scan to FORMAT and a comparison.
-
-On top of that, a site where every input agrees on REF, ALT and FORMAT — the
-overwhelmingly common case — skips allele renumbering and the FORMAT union
-entirely, and each input's genotype columns are copied across in one memcpy.
-
-The cost is memory: batches in flight take `merge` from about 10 MiB to 60 MiB.
-Batches are bounded by input bytes rather than by site count, so that figure
-does not grow with the sample count.
-
-**`concat --naive` never touches the deflate stream.** Concatenating files that
-share a header does not require recompression: after locating the end of each
-header, the remaining BGZF blocks are already valid output and are copied
-verbatim. Only the single block straddling the end of the header is re-encoded.
-This turns concatenation into roughly a file copy.
-
 ## Benchmarks
 
-`bench/bench.sh` runs each operation through both tools with identical inputs,
-identical filters and identical output formats, and reports the best of N runs.
+All numbers below come from **one session on one 4-core machine** (bcftools
+1.19 / htslib 1.19, both tools `--threads 4`, best of 2 interleaved rounds,
+page cache flushed before each timed run). "cores" is CPU-seconds over wall
+seconds — the parallelism actually achieved — because a speedup on its own is
+ambiguous: a tool can be faster because it is better, or because it was
+handed more cores.
 
-All numbers are best-of-3 from a single run of `bench/bench.sh` on a 4-core
-machine, bcftools 1.19 / htslib 1.19, against a 381 MB BGZF file (250,000 sites
-x 500 samples, ~2.5 GB of VCF text). Both tools are given `--threads 4`.
+### Generic call set
 
-The harness records what each tool actually spent, not just how long it took,
-because a speedup on its own is ambiguous: a tool can be faster because it is
-better, or because it was handed more cores. "cores" is CPU seconds over wall
-seconds — the average parallelism actually achieved.
+381 MB BGZF file, 250,000 sites × 500 samples (~2.5 GB of VCF text), the
+shape of an ordinary genotyped cohort.
 
-| operation | bcftools | vcfr | speedup | cores b → v | CPU-s b → v | output b / v |
-| --- | ---: | ---: | ---: | :---: | :---: | :---: |
-| `view`: decompress to VCF | 19.74s | 0.86s | **22.9x** | 1.16 → 3.39 | 22.9 → 2.9 | — |
-| `view`: BGZF → BGZF re-compress | 26.59s | 12.02s | 2.21x † | 3.41 → 3.86 | 90.9 → 46.5 | 381M / 411M |
-| `view`: subset 50 of 500 samples, BGZF | 13.60s | 2.45s | 5.55x † | 1.77 → 3.38 | 24.1 → 8.3 | 43M / 46M |
-| `view`: subset 50 of 500 samples, VCF | 13.71s | 1.77s | **7.7x** | 1.23 → 2.37 | 17.0 → 4.2 | — |
-| `view`: SNPs only, BGZF | 22.54s | 9.40s | 2.39x † | 3.40 → 3.79 | 76.7 → 35.7 | 306M / 330M |
-| `view`: biallelic SNPs + PASS, BGZF | 20.70s | 8.11s | 2.55x † | 3.32 → 3.88 | 68.9 → 31.5 | 268M / 290M |
-| `view`: region `chr2`, BGZF | 15.58s | 3.27s | 4.76x † | 2.16 → 3.47 | 33.7 → 11.4 | 96M / 103M |
-| `view`: drop genotypes, BGZF | 12.12s | 1.91s | 6.34x † | 1.29 → 1.73 | 15.7 → 3.3 | 3.1M / 3.2M |
-| `concat`: 4 parts → BGZF | 19.27s | 11.66s | 1.65x † | 3.71 → 3.80 | 71.5 → 44.3 | 381M / 411M |
-| `concat --naive`: 4 parts → BGZF | 1.14s | 0.52s | 2.2x ‡ | 0.37 → 0.82 | 0.4 → 0.4 | 411M / 411M |
-| `merge`: 3 cohorts → BGZF | 27.25s | 10.37s | 2.62x † | 3.15 → 3.81 | 85.9 → 39.6 | 331M / 356M |
-| `merge`: 3 cohorts → VCF | 24.83s | 1.68s | **14.8x** | 1.12 → 3.32 | 27.9 → 5.6 | — |
+| operation | bcftools | vcfr | speedup | cores b → v | output b / v |
+| --- | ---: | ---: | ---: | :---: | :---: |
+| `view`: decompress to VCF | 20.1s | 0.66s | **30x** | 1.2 → 3.9 | — |
+| `view`: recompress to BGZF | 26.4s | 11.5s | 2.3x † | 3.5 → 4.0 | 398M / 430M |
+| `view`: subset 50 of 500 samples | 13.7s | 2.5s | **5.5x** | 1.8 → 3.3 | 45M / 48M |
+| `concat`: 4 parts → BGZF | 18.9s | 11.0s | 1.7x † | 3.8 → 4.0 | 398M / 430M |
+| `concat --naive` (block copy) | 1.6s | 0.3s | I/O-bound ‡ | — | 430M / 430M |
+| `merge`: 3 cohorts → VCF | 25.7s | 1.8s | **14x** | 1.1 → 3.2 | — |
+| `merge`: 3 cohorts → BGZF | 27.2s | 10.1s | 2.7x † | 3.2 → 4.0 | 346M / 372M |
+| `merge`: 3 cohorts → BGZF, `-l 7` | 27.2s | 15.7s | **1.7x** | 3.2 → 4.0 | 346M / 345M |
 
-Single-threaded — one OS thread each, all six measured at 0.99 cores, so this is
-the cleanest like-for-like comparison in the set:
+### Imputed sequence data (Beagle-style)
 
-| operation | bcftools | vcfr | speedup | cores b → v |
-| --- | ---: | ---: | ---: | :---: |
-| `view`: decompress to VCF | 20.51s | 2.09s | **9.8x** | 0.99 → 0.99 |
-| `view`: BGZF → BGZF | 87.24s | 42.17s | 2.07x † | 0.99 → 0.99 |
-| `merge`: 3 cohorts → BGZF | 81.78s | 39.37s | 2.08x † | 0.99 → 0.99 |
+Three 300-sample cohorts × 150,000 sites of Beagle output shape — phased
+`GT:DS:GP`, `DR2`/`AF`/`IMP` INFO, allele frequencies drawn from the
+sequence spectrum (log-uniform on [2e-4, 0.5], ~50% of sites under 1% AF,
+mostly hom-ref genotypes; `examples/gen_beagle --af-spectrum seq`). ~3.2 GB
+of merged text. The gap is wider than on the generic set because rare-variant
+text makes vcfr's copy path and the compressor cheaper per byte, while
+bcftools still decodes and re-renders every DS/GP float.
 
-### What the resource columns say
+| operation | bcftools | vcfr | speedup | cores b → v | output b / v |
+| --- | ---: | ---: | ---: | :---: | :---: |
+| `merge`: 3 cohorts → VCF | 37.3s | 1.6s | **23x** | 1.1 → 3.0 | — |
+| `merge`: 3 cohorts → BGZF | 39.9s | 6.6s | **6.1x** | 2.2 → 3.9 | 145M / 160M |
+| `merge`: 3 cohorts → BGZF, `-l 7` | 39.9s | 12.9s | **3.1x** | 2.2 → 4.0 | 145M / 149M |
 
-**The speedups are not bought with extra cores.** On the compression-bound rows
-both tools sit in the same band — 3.41 vs 3.86, 3.40 vs 3.79, 3.32 vs 3.88,
-3.71 vs 3.80 — and the CPU-seconds column, the efficiency measure, tracks the
-speedups closely: roughly half the CPU for the same work. bcftools also spawns
-more OS threads than `vcfr` throughout (6-9 against 5-8): htslib's `--threads N`
-means N workers *beyond* the main thread, and it creates more than one pool.
+### Wide cohorts and block splicing
 
-**Two rows do depend on parallelism bcftools leaves unused.** Decompress to VCF
-has bcftools at 1.16 cores against `vcfr`'s 3.39, and `merge` to VCF 1.12
-against 3.32 — bcftools barely parallelises either path. Some of those 22.9x
-and 14.8x figures is that gap rather than the code. The underlying efficiency
-gaps are smaller but still large: 22.9 against 2.9 CPU-seconds, and 27.9
-against 5.6. The single-threaded rows isolate the first honestly at 9.8x.
+Ten batches of 220,000 samples each (2.2M samples merged; lines are ~30-44 MB
+of text spanning up to ~670 BGZF blocks). Here `merge -Oz` and wide `view -s`
+skip most deflate work entirely by **block splicing**: an input block whose
+content lies wholly inside a verbatim-copied stretch of a line is passed into
+the output still compressed (see below). The subset row drops 3 of 220,000
+samples from one batch.
 
-### † Read the BGZF-output rows carefully
+| operation | bcftools | vcfr unspliced | vcfr spliced | speedup | output b / unspliced / spliced |
+| --- | ---: | ---: | ---: | ---: | :---: |
+| `merge`: 10 × 220k samples → BGZF | 33.7s | 7.8s | 6.4s | **5.2x** | 46M / 50M / 46M |
+| `view -S ^3`: drop 3 of 220k → BGZF | 2.9s | 0.6s | 0.4s | **7.0x** | — / 5M / 4M |
 
-`vcfr` deflates with libdeflate and `bcftools` with zlib, and the two disagree
-about what a compression level means: at the shared default of 6, libdeflate is
-faster but weaker. The rows marked † are therefore not comparing equal work —
-`vcfr` produced a **larger** file. Calibrating on the re-compress case:
+Splicing here cuts vcfr's own CPU roughly in half (merge: 15.2 → 8.6
+CPU-seconds) and — because copied blocks keep the input's compression — closes
+the output-size gap with bcftools to ~0.3%. Decompressed output is
+byte-identical with splicing on or off (`VCFR_NO_SPLICE=1` disables it).
+
+### † Compression levels: read the BGZF rows carefully
+
+`vcfr` deflates with libdeflate and `bcftools` with zlib, and the two
+disagree about what a level means: at the shared default of 6, libdeflate is
+faster but weaker, so the † rows compare unequal work — vcfr produced a
+larger file. `-l 7` matches bcftools' default output size almost exactly
+(the `-l 7` rows above are the fair matched-ratio comparison). The full
+curve on the generic recompress case, same session:
 
 | encoder | time | output |
 | --- | ---: | ---: |
-| `bcftools -Oz` (zlib 6, the default) | 26.80s | 398,917,159 |
-| `vcfr -Oz -l 1` | 4.59s | 498,181,180 (+24.9%) |
-| `vcfr -Oz -l 6` (libdeflate 6, the default) | 11.58s | 430,610,327 (+8.0%) |
-| `vcfr -Oz -l 7` | 18.54s | 398,712,552 (−0.05%) |
-| `vcfr -Oz -l 8` | 38.29s | 372,607,066 (−6.6%) |
+| `vcfr -l 0` (built-in Rust encoder) | 3.7s | 476M (+19%) |
+| `vcfr -l 1` | 3.9s | 498M (+25%) |
+| `vcfr -l 6` (default) | 11.5s | 430M (+8%) |
+| `vcfr -l 7` | 17.8s | 398M (±0%) |
+| `bcftools -Oz` (zlib 6, default) | 26.4s | 398M |
+| `vcfr -l 8` | 37.9s | 372M (−7%) |
 
-**At a matched compression ratio, `vcfr -l 7` beats `bcftools` by 1.45x on pure
-re-compression**, with the outputs within 0.05% of each other. An independent
-interleaved A/B put it at 1.45x, 1.45x, 1.44x over three rounds. Every † row
-should be read the same way: part of the margin is `vcfr` compressing less.
-Pass `-l 7` for output the size `bcftools` would have produced.
-
-The level curve is worth exploiting deliberately: the whole span from `-l 0` to
-`-l 8` trades a large range in time against a 34% range in size. For scratch
-and intermediate files, `-l 0` (vcfr's own encoder) is the best fast point —
-about 5% faster than `-l 1` end-to-end with 4.3% smaller output; for archives,
-`-l 8` out-compresses bcftools' default.
+Rules of thumb: `-l 0` for scratch and intermediate files (7x faster than
+bcftools at +19% size), the default for general use, `-l 7` when the file
+should be the size bcftools would have made, `-l 8` for archives.
 
 ### ‡ `concat --naive` is I/O-bound
 
-Both tools copy the same blocks and land within 4 KB of each other on a 411 MB
-output, so the comparison is like-for-like — but it is a file copy, and its
-ratio moves with page-cache and writeback state rather than with CPU. Across
-runs it measured anywhere from 1.8x to 4.4x. Treat it as "roughly 2-3x, and not
-the interesting part".
+Both tools copy the same compressed blocks, so this is a file copy: ~130x
+less CPU than recompressing (measured 1.4s CPU against 184s for 1.7 GB of
+parts), with wall time set by the disk and page cache, not the code.
 
-The rows in bold are the ones the design targets: work bounded by parsing and
-moving bytes rather than by DEFLATE. Where DEFLATE dominates, `vcfr` sits at
-3.8-3.9 of 4 cores — within a few percent of the machine's limit — so the
-remaining lever there is the compression level, not the code.
+### Scaling notes
 
-### Bigger inputs and thread scaling
+Measured separately, same machine: a 4x input (1.5 GB BGZF, ~10 GB text)
+reproduces every ratio above within noise, and both tools scale linearly in
+input size. Thread scaling on the compression-bound path: vcfr reaches 96%
+parallel efficiency at 4 threads against bcftools' 71%, so the head-to-head
+gap widens with cores (1.7x at one thread, 2.3x at four on the generic
+recompress). On the parse-bound `-Ov` path bcftools stays at ~1.1 cores
+regardless of `--threads`, while vcfr scales it. Merge memory is bounded by
+line bytes, not file size: ~60 MiB on the generic set, ~750 MiB at 2.2M
+samples (whole lines in flight), against bcftools' ~1.15 GB there.
 
-The same suite run on a 4x input — 500,000 sites x 1,000 samples, a 1.5 GB
-BGZF file holding ~10 GB of VCF text — reproduces every ratio above within
-noise (best of 2, same machine):
+Reproduce with `bench/bench.sh --sites 250000 --samples 500 --reps 3`
+(fixtures are generated and cached in `bench/data/`). The harness aborts on
+non-zero exits (a failed command must not produce a timing), checks free
+disk first, and `sync`s between runs — each of those defends against a
+failure mode that produced a wrong number at least once during development.
 
-| operation | bcftools | vcfr | speedup | cores b → v |
-| --- | ---: | ---: | ---: | :---: |
-| `view`: decompress to VCF | 77.73s | 3.11s | **25.0x** | 1.17 → 3.58 |
-| `view`: BGZF → BGZF re-compress | 109.50s | 46.57s | 2.35x † | 3.41 → 3.85 |
-| `view`: subset 50 of 1000 samples, BGZF | 50.79s | 8.79s | 5.77x † | 1.54 → 2.72 |
-| `view`: SNPs only, BGZF | 91.71s | 38.35s | 2.39x † | 3.36 → 3.85 |
-| `concat`: 4 parts → BGZF | 79.42s | 46.55s | 1.70x † | 3.68 → 3.87 |
-| `merge`: 3 cohorts → BGZF | 105.57s | 41.77s | 2.52x † | 3.22 → 3.85 |
-| `merge`: 3 cohorts → VCF | 94.89s | 6.19s | **15.3x** | 1.12 → 3.34 |
+## Why it is fast
 
-Both tools scale linearly in input size (4.1x the data took each ~3.9x
-longer), doubling the sample width changes nothing, and the matched-ratio
-calibration lands in the same place (`-l 7`: 74.83s against 107.47s, 1.44x).
-Subsetting 50 of 1000 samples on this file is byte-identical to bcftools
-across all 500,000 records, as is merging the three 333-sample cohorts; and
-`merge`'s peak memory stays flat because its batches are bounded by bytes, not
-sites.
+**Nothing is parsed until it is needed.** A record is indexed by scanning
+for tab positions; fields a command doesn't touch are never looked at. A
+record that survives a filter unchanged costs one `memchr` scan and one
+`write_all`. Genotypes are decoded only when actually needed (AC/AN
+recomputation, allele renumbering).
 
-Thread scaling, measured on the same 4x input (single runs, tools alternating;
-this machine has 4 physical cores, so 8 threads tests oversubscription, not
-scaling):
+**BGZF is (de)compressed on every core.** Blocks are self-contained, so
+inflation and deflation are farmed out to a worker pool and reassembled in
+order (`src/pool.rs`). The thread budget follows the bottleneck: deflate
+costs ~6x inflate, so `-O z` gives the writer the whole budget and `-O v`
+gives everything to readers. `--threads 1` really is one thread — the codec
+runs inline, not on a pool of one.
 
-| threads | bcftools `-Oz` | cores | vcfr `-Oz` | cores | head-to-head |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 297.9s | 1.27 | 176.4s | 0.99 | 1.69x |
-| 2 | 149.1s | 2.49 | 80.1s | 2.30 | 1.86x |
-| 4 | 104.9s | 3.50 | 45.9s | 3.93 | 2.29x |
-| 8 | 104.0s | 3.55 | 46.6s | 3.94 | 2.23x |
+**Unchanged compressed blocks are never re-encoded.** Three mechanisms, in
+increasing granularity: `concat --naive` copies whole files' blocks verbatim
+after checking headers match; and on wide cohorts (≥16,384 samples, where
+one line spans many blocks), `merge` and `view` **splice** input blocks
+through: a block whose uncompressed content contains no newline lies wholly
+inside one line, and when that stretch of the line is copied to the output
+verbatim — merge's uniform-site fast path, or a kept run of samples under
+`view -s` — the compressed block is equally valid output, since BGZF blocks
+are self-contained gzip members with their own CRCs and records need not
+align to block boundaries (`src/bgzf/spliced.rs`). Only boundary blocks are
+re-deflated. Splicing engages per file from the header's sample count;
+scattered or reordered `-s` selections have no spliceable runs and fall back
+to plain recompression automatically.
 
-Three things this table says. `vcfr`'s parallel efficiency at 4 threads is 96%
-(3.85x the single-thread time) against bcftools' 71%, so the head-to-head gap
-*widens* as threads are added — 1.69x at one, 2.29x at four. `vcfr`'s total CPU
-is flat across thread counts (176-185s), i.e. the parallelism is close to free.
-And oversubscribing 8 threads onto 4 cores costs neither tool anything. Whether
-the efficiency gap keeps widening past 4 cores is extrapolation — this machine
-cannot measure it.
+**Two built-in DEFLATE encoders** (`src/deflate`). `-l 0` trains one
+canonical Huffman code set on an early block and compresses every block in a
+single greedy pass — no counting, no code construction, a 6-byte match hash
+because VCF text is saturated with 4-byte collisions (`\t0/0`, `:12,`). It
+beats libdeflate level 1 on both axes and is the fastest option. `--codec
+rust` levels 1-6 are the opposite trade: a lazy hash-chain matcher plus
+exact per-block Huffman codes, tracing libdeflate's speed/ratio frontier
+from about l4 to l9 point-for-point (on rare-variant data `--codec rust -l 4`
+beat `lib -l 7` end-to-end at matched size; on the generic set it doesn't —
+data-dependent, measure on yours). Both emit ordinary DEFLATE that htslib
+reads and indexes. Match extension uses AVX2 (32-byte compares behind
+runtime detection, worth ~7-8%, SWAR fallback elsewhere); an AVX-512 variant
+and vectorized hash insertion both measured slower and were dropped. Levels
+1-12 default to libdeflate; decompression is libdeflate throughout.
 
-On the parse-bound path the thread column is one-sided: bcftools runs `-Ov` at
-1.16 cores whatever `--threads` is set to, while `vcfr` scales it (8.60s at
-one thread, 3.46s at four — 22x head-to-head on this file). The cores column
-also shows htslib's `--threads 1` really running 1.27 cores: htslib counts
-workers *beyond* the main thread.
-
-### Notes on method
-
-Two failure modes cost real time in developing this table, and the harness now
-defends against both:
-
-- **A command that fails still produces a timing.** An early version of this
-  table quoted a 10.9x `--naive` speedup that was really `vcfr` refusing to run
-  and exiting instantly. The harness now aborts on a non-zero exit.
-- **A full disk does not announce itself.** It slows both tools together through
-  writeback throttling, so the ratios still look plausible and the numbers are
-  quietly worthless — this invalidated an entire run and a measurement that
-  overstated a change by 3x before it was caught. The harness now checks free
-  space before starting, and flushes dirty pages before each timed run so a row
-  is not timed while the previous row's writeback is still in flight.
-
-Absolute times drift by 20% or so between runs on this host, so figures from
-different runs are not comparable; everything in the tables above comes from one
-run, and the two independent checks quoted are labelled as such.
-
-Reproduce with:
-
-```sh
-cargo build --release && cargo build --release --example gen
-bench/bench.sh --sites 250000 --samples 500 --reps 3
-```
-
-`--sites` and `--samples` control the fixture size; fixtures are cached in
-`bench/data/` and reused across runs. The parts used by `concat` are split with
-`vcfr`, not `bcftools`, because `bcftools view -r` records the region it was
-given in a `##bcftools_viewCommand` header line — which would leave the parts
-with differing headers and make `--naive` inapplicable to them.
+**`merge` keeps its serial thread minimal.** Combining k sorted streams is
+inherently serial, so that thread must not also inflate (each input gets a
+reader worker) or assemble records (formatting pools, or splicing writes).
+Lines are moved, not copied. At sites where every input agrees on REF, ALT
+and FORMAT — essentially every site when cohorts were imputed on one panel —
+allele renumbering and FORMAT union are skipped and each input's sample
+columns are copied in one memcpy (or spliced compressed, above).
 
 ## Correctness
 
 ```sh
-cargo test                 # unit tests: BGZF codec, line splitting, VCF primitives
-tests/differential.sh      # 41 paired comparisons against bcftools
+cargo test                 # 37 unit tests: codecs, splicing, VCF primitives
+tests/differential.sh      # 58 paired checks against bcftools 1.19
 ```
 
-The differential suite compares `vcfr` output to `bcftools` output line by line,
-covering sample subsetting (including the `AC`/`AN` recalculation `bcftools`
-performs by default), variant-type and region filters, allele renumbering across
-files with disagreeing ALT sets, `--info-rules`, all five `-m` merge modes, and
-round-tripping BGZF through `bgzip`, `htslib` and `vcfr` in every direction.
+The differential suite covers sample subsetting (including AC/AN
+recalculation and its header declarations), variant-type and region filters,
+allele renumbering across disagreeing ALT sets, `--info-rules`, all five
+`-m` merge modes, BGZF interop in every direction (bgzip, htslib, both
+built-in encoders, spliced streams), wide-cohort splicing against the
+unspliced path byte-for-byte, and clean `| head` behaviour for every
+command. Merged imputation output was additionally verified semantically at
+2.2M samples: fixed columns and INFO identical after float normalisation,
+all GT columns byte-identical, DS/GP numerically equal.
 
-Two deliberate differences from `bcftools`:
-
-- **INFO key order.** `vcfr` keeps the order the fields appeared in; `bcftools`
-  reshuffles them as a side effect of updating `AC`/`AN`. Key order carries no
-  meaning in VCF, so the differential suite sorts INFO keys before comparing.
-- **`vcfr` does not stamp provenance headers** (`##bcftools_viewCommand=…`) into
-  its output.
+Deliberate differences from bcftools: INFO key order is preserved rather
+than reshuffled (key order carries no meaning; the suite sorts before
+comparing), floats are passed through as text rather than re-rendered
+(`0.0310` stays `0.0310`), and no `##bcftools_*` provenance headers are
+stamped. AC/AN follow bcftools' rules: recomputed on merge only when an
+input header declares them; declared in the header when `view -s`
+recomputes them.
 
 ## Commands
 
@@ -327,34 +219,26 @@ Subsets samples and variants, and converts between plain VCF and BGZF.
 | `-h/-H` | header only / suppress header |
 | `-I, --no-update` | leave `INFO/AC` and `INFO/AN` alone when subsetting |
 
-`vcfr` always streams, so `-r` needs no index and behaves like `bcftools view -t`
-rather than `bcftools view -r`. On a coordinate-sorted file it still stops
-reading once it has passed the last requested region.
-
-Note that `-q`/`-Q` are deliberately **not** accepted as short forms of
-`--min-qual`/`--max-qual`: in `bcftools` those letters mean minimum and maximum
-*allele frequency*, and silently reinterpreting them would be a trap.
+`vcfr` always streams, so `-r` needs no index and behaves like `bcftools
+view -t` (it still stops reading once past the last requested region).
+`-q`/`-Q` are deliberately not accepted as short forms of `--min-qual`/
+`--max-qual`: in bcftools those letters mean allele *frequency* bounds.
 
 ### `vcfr concat`
 
-Concatenates files that carry the same samples in the same order — the usual
-"one file per chromosome" case. Headers are merged (first definition of each ID
-wins) and sample lists must match exactly.
-
-`--naive` copies compressed blocks straight through. It requires BGZF input,
-BGZF output, and byte-identical headers — and it checks, refusing to run when
-the headers differ rather than silently emitting the first file's header over
-everyone's records. Note that files split with `bcftools view -r` are *not*
-eligible, because bcftools records the region it was given in a
-`##bcftools_viewCommand` header line, making every part's header different.
+Concatenates files carrying the same samples in the same order (the one-file
+-per-chromosome case). `--naive` copies compressed blocks straight through;
+it requires BGZF input and output and byte-identical headers, and refuses to
+run otherwise. Files split with `bcftools view -r` are not eligible because
+bcftools stamps the region into a header line, making every part's header
+differ.
 
 ### `vcfr merge`
 
-Merges files that carry *different* samples into one multi-sample file. At each
-site the ALT alleles are unioned, every input's genotypes are renumbered onto
-the merged allele list, and `Number=A`/`Number=R` INFO and FORMAT values are
-re-indexed to match. Samples absent from a file are filled with `./.` (or `0/0`
-under `-0`).
+Merges files carrying *different* samples into one multi-sample file: ALT
+alleles are unioned per site, genotypes renumbered onto the merged allele
+list, `Number=A`/`R` values re-indexed, absent samples filled with `./.`
+(or `0/0` under `-0`).
 
 | flag | meaning |
 | --- | --- |
@@ -364,120 +248,11 @@ under `-0`).
 | `--force-samples` | rename duplicate sample names rather than failing |
 | `-I, --no-update` | do not recompute `INFO/AC` and `INFO/AN` |
 
-`-m` decides which records at one position may become a single multiallelic
-record: `both` keeps SNPs and indels in separate records, `all` combines
-everything sharing a REF, `none` creates no new multiallelics. Records whose
-alleles are already a subset of another's are combined under every mode, since
-that introduces no new allele.
-
-On imputation output such as Beagle's (phased `GT:DS:GP` with `DR2`/`AF`/`IMP`
-INFO and an identical site universe across cohorts), a 3-way merge of 300-sample
-cohorts measured 28-30x bcftools with plain output and ~4x with BGZF output:
-the uniform-site fast path copies each cohort's columns with one memcpy while
-bcftools decodes every dosage and genotype-probability float into its binary
-representation and re-renders it. Output was verified semantically identical —
-genotypes byte-for-byte, floats as values — since bcftools rewrites `0.0310`
-as `0.031` and reorders INFO keys, which vcfr deliberately does not. Note that
-merging follows bcftools' rule for `INFO/AC`+`INFO/AN`: they are recomputed
-and added only when an input header declares them, so Beagle-style files do
-not silently grow AC/AN. One robustness difference: inputs carrying different
-REF alleles at the same position (malformed against any single reference) make
-bcftools abort mid-merge, while vcfr emits them as separate records.
-
-Imputed *sequence* data skews heavily toward rare variants, and that shape was
-tested separately: `examples/gen_beagle --af-spectrum seq` draws site allele
-frequencies log-uniformly on [2e-4, 0.5] — density proportional to 1/AF, the
-neutral spectrum behind resequencing panels such as 1000 Bull Genomes, verified
-at ~20% of sites below 0.1% AF and ~50% below 1% — with DR2 degrading with
-rarity the way imputation accuracy does. On a 3-way, 300-samples-each,
-150k-site merge of that shape (3.2GB of merged text, mostly hom-ref
-genotypes), merging to BGZF measured: bcftools `-Oz` 31.4–32.0s at 2.3 cores
-(145MB out) against vcfr `-Oz` 5.6–6.0s at 3.8 cores (160MB out) — **5.3–5.7x**
-— and at near-matched output size vcfr `-l 7` 11.1–11.2s (149MB, +2.8%),
-**2.8–2.9x**. Speed-first levels: `-l 1` 3.8s and `-l 0` 2.7–3.0s (~11x) at
-+68% size. The gap is wider than the uniform-AF case's ~4x because rare-variant
-text is dominated by repeated `0|0:0.0x:…` runs: both the merge fast path and
-the compressor get cheaper per byte, and bcftools' float decode/re-render cost
-doesn't. Output verified as above — fixed columns and INFO identical after
-float normalisation, all 900 GT columns byte-identical, DS/GP numerically
-equal on sampled lines. Peak RSS: vcfr ~40MiB, bcftools ~13MiB.
-
-`--render beagle` makes the generator mimic real Beagle byte habits,
-calibrated on a snapshot of production imputed bovine sequence data: floats
-trimmed of trailing zeros (`0|0:0:1,0,0`), IMP first in INFO, AF to four
-decimals, and GP fuzz scaling with site heterozygosity and 1−DR2. On that
-rendering (150k sites × 300 samples, ~73% of sample fields exactly
-`0|0:0:1,0,0`), stripping FORMAT fields and re-bgzipping measured: dropping
-DS+GP (keeping GT) shrinks the `.vcf.gz` by **74–75%**; dropping only GP
-while keeping DS saves **38%** — GP is largely predictable from DS, so the
-compressor was already paying little for it relative to its text size (it is
-half the uncompressed bytes but carries far less entropy).
-
-A GT-only variant of the same output (`examples/gen_beagle --gt-only`: phased
-`0|1` with no DS/GP and no DR2/AF/IMP — a phasing-only pipeline, or Beagle
-output already stripped of dosage) merges byte-for-byte identical to bcftools
-with no normalisation needed, since there are no floats to re-render. It is
-faster still relative to bcftools on `-Oz` (2.6x, against ~4x for the DS/GP
-case — bcftools' own per-record overhead was heavier there and shrinks along
-with the payload) but *less* dramatically faster on plain output (13x against
-28-30x): with almost nothing per sample, the fixed per-site cost of grouping
-and allele-union bookkeeping is a bigger share of vcfr's own time, so bcftools'
-slower baseline has less absolute work left to save.
-
-On very wide cohorts, `merge -Oz` skips most of the deflate work entirely by
-**block splicing** (`src/bgzf/spliced.rs`): a 2.2M-sample line is ~30MB of
-text spanning hundreds of BGZF blocks, and any input block whose uncompressed
-content contains no newline lies wholly inside one line — if that stretch of
-the line is copied into the output verbatim (the uniform-site fast path),
-the *compressed* block is equally valid output, since BGZF blocks are
-self-contained gzip members with their own CRCs and records need not align
-to block boundaries. The reader keeps the raw blocks alongside each line,
-and emit flushes its buffered text as a (possibly short) block and splices
-the input blocks through the ordered writer pool untouched; only the
-boundary blocks — fixed columns at the head, the newline at the tail — are
-re-deflated. Measured on a 10-batch × 220k-sample merge (2.2M samples out,
-~44MB lines, ~670 blocks per line): ~1.8x less CPU and 20-40% less wall
-than the non-spliced path, output *smaller* (spliced blocks keep the
-input's compression, closing the usual size gap with bcftools to ~0.3%),
-decompressed output byte-identical, and htslib reads and indexes the mixed
-stream. The spliced reader hands whole lines over a channel, which costs
-too much per line on narrow data — measured 2-3x slower at 300 samples —
-so each input engages it only when its header shows ≥16384 samples; below
-that the chunked reader path is unchanged. `VCFR_NO_SPLICE=1` disables it
-for measurement. One semantic note: spliced output blocks carry whatever
-compression level the *input* was written at; only re-encoded boundary
-blocks honour `-l`.
-
-`view` splices under the same gate: with no sample change (pure region or
-site filtering of a wide file) every kept line splices whole, and under
-`-s`/`-S` each maximal run of samples kept consecutively and in file order
-is a verbatim byte range whose interior blocks pass through compressed. The
-arithmetic decides when that helps: a block holds ~5,000 GT:DS:GP samples,
-so dropping a handful of animals or keeping a contiguous slice splices
-nearly everything (dropping 3 of 220k measured ~1.3x wall and ~2.2x less
-CPU than recompressing, ~6x bcftools), while a scattered pick (every 2nd
-animal) has runs of ~2 samples and correctly falls back to plain
-recompression. A reordered `-s` list also disables splicing. Fixing the
-verification for this surfaced a conformance gap: `view -s` recomputed
-AC/AN into INFO without declaring them in the header (bcftools declares
-them); it now adds the same header lines bcftools does.
-
-Testing both variants surfaced a real bug, not a benchmark curiosity: `merge`
-and `concat --naive` could each leak a `Broken pipe` failure to stderr and a
-nonzero exit when piped into something that closes early (`| head`), because
-their write sites stringified the write error before `ignore_broken_pipe`
-could see its `ErrorKind`. `view` and `concat`'s main path were already
-correct — they route through an `io::Result` closure `ignore_broken_pipe`
-wraps wholesale — but `merge`'s write points sit inside a closure that also
-carries genuinely-stringified errors from parsing, so the whole closure
-couldn't be converted; each write site now checks for `BrokenPipe` before it
-is stringified instead. Regression-tested for all four commands.
-
-Known limits: REF padding is not performed, so records at the same position with
-different REF strings (`A→AT` in one file, `AT→A` in another) stay separate
-rather than being rewritten onto a common REF. `Number=G` values (such as `PL`)
-are dropped from a record whose alleles had to be renumbered, because they
-cannot be re-indexed without the full genotype ordering.
+Known limits: REF padding is not performed (records at one position with
+different REF strings stay separate — where bcftools instead aborts on such
+input, vcfr emits them as separate records); `Number=G` values are dropped
+from records whose alleles had to be renumbered, since they cannot be
+re-indexed without the full genotype ordering.
 
 ### Shared output options
 
@@ -485,14 +260,13 @@ cannot be re-indexed without the full genotype ordering.
 | --- | --- |
 | `-o, --output FILE` | output path (default stdout) |
 | `-O, --output-type v\|z` | plain VCF or BGZF; inferred from a `.gz` path |
-| `-l, --compression-level N` | 1–12, default 6 |
+| `-l, --compression-level N` | 0-12, default 6; 0 is the built-in fast encoder |
+| `--codec lib\|rust` | libdeflate (default) or the pure-Rust encoders for levels 1-6 |
 | `--threads N` | worker threads, `0` = all cores (default) |
 
-## Input formats
-
-Plain VCF, BGZF, and ordinary gzip are all detected from the file contents
-rather than the extension. `-` reads standard input. Output is plain VCF or
-BGZF; BCF is not supported.
+Input may be plain VCF, BGZF or ordinary gzip, detected from content rather
+than extension; `-` reads stdin. Output is plain VCF or BGZF; BCF is not
+supported.
 
 ## Building
 
@@ -500,29 +274,29 @@ BGZF; BCF is not supported.
 cargo build --release      # target/release/vcfr
 ```
 
-For a few percent more, build with profile-guided optimisation:
-
-```sh
-rustup component add llvm-tools
-scripts/build-pgo.sh       # target/pgo/release/vcfr
-```
-
-Measured interleaved against the plain build: ~7% on `-l 0` end-to-end and
-~5% on the encoder itself, with byte-identical output; the libdeflate levels
-gain only 1-3% because the C library is not instrumented.
-
-Dependencies: `libdeflater` (the codec), `memchr`, `flate2` (non-BGZF gzip
-input only), and `clap`.
+`scripts/build-pgo.sh` builds with profile-guided optimisation (~7% on
+`-l 0` end-to-end, byte-identical output; needs `rustup component add
+llvm-tools`). Dependencies: `libdeflater`, `memchr`, `flate2` (plain-gzip
+input only), `crc32fast`, and `clap`.
 
 ## Test data
 
-`examples/gen.rs` generates deterministic VCFs for the tests and benchmarks:
+Two deterministic generators feed the tests and benchmarks:
 
 ```sh
 cargo run --release --example gen -- --sites 100000 --samples 500 > big.vcf
+cargo run --release --example gen_beagle -- --sites 150000 --samples 300 \
+    --af-spectrum seq --render beagle --sample-prefix A_ --gt-seed 11 > cohortA.vcf
 ```
 
-Sites depend only on `--site-seed`, so two runs differing only in `--gt-seed`
-and `--sample-prefix` describe the same variants for different cohorts — which
-is exactly the input `merge` expects. `--drop-pct` omits a fraction of sites so
-the cohorts overlap only partially.
+`gen.rs` makes generic call sets; sites depend only on `--site-seed`, so
+runs differing in `--gt-seed`/`--sample-prefix` describe the same variants
+for different cohorts — exactly what `merge` expects, with `--drop-pct` for
+partial overlap. `gen_beagle.rs` mimics Beagle imputation output;
+`--af-spectrum seq` draws the rare-variant-heavy sequence spectrum and
+`--render beagle` reproduces real Beagle byte habits (trimmed floats,
+`0|0:0:1,0,0` hom-ref fields, DR2/heterozygosity-scaled genotype
+probabilities), calibrated on a snapshot of production imputed bovine
+sequence data. One practical finding from that data, measured with these
+tools: dropping FORMAT `DS`+`GP` shrinks a `.vcf.gz` by ~74%; dropping only
+`GP` while keeping dosages saves ~38%.
