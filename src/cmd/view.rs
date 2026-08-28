@@ -2,13 +2,21 @@
 
 use std::io::Write;
 
-use crate::io::open_reader;
+use crate::bgzf::spliced::{InteriorBlock, SplicedLineReader};
+use crate::io::{detect_compression, open_reader, Compression};
 use crate::lines::BufSource;
 use crate::vcf::header::{select_samples, Header};
 use crate::vcf::record::*;
 use crate::vcf::RegionSet;
 
-use super::{ignore_broken_pipe, resolve_threads, split_threads, OutputOpts};
+use super::{ignore_broken_pipe, resolve_threads, splice_range, split_threads, OutputOpts};
+
+/// The ordinary chunked reader, or the block-keeping one used when interior
+/// blocks of wide lines can be spliced into BGZF output uncompressed.
+enum VReader {
+    Plain(crate::io::Reader),
+    Spliced(SplicedLineReader),
+}
 
 #[derive(clap::Args, Debug)]
 pub struct ViewArgs {
@@ -148,6 +156,18 @@ pub fn run(a: &ViewArgs) -> Result<(), String> {
         (None, None) => None,
     };
 
+    // AC/AN only need recomputing when the sample set actually changed.
+    let update_info = !a.no_update
+        && !a.drop_genotypes
+        && selected.as_ref().map_or(false, |s| s.len() != hdr.samples.len());
+    let needs_samples = selected.is_some() || a.drop_genotypes || update_info || a.min_ac.is_some();
+    // The recomputed fields must be declared, as bcftools declares them.
+    let mut hdr = hdr;
+    if update_info {
+        hdr.ensure_meta("INFO", "AC", "##INFO=<ID=AC,Number=A,Type=Integer,Description=\"Allele count in genotypes\">");
+        hdr.ensure_meta("INFO", "AN", "##INFO=<ID=AN,Number=1,Type=Integer,Description=\"Total number of alleles in called genotypes\">");
+    }
+
     let mut w = a.out.writer(wthreads)?;
     let mut buf: Vec<u8> = Vec::with_capacity(1 << 16);
 
@@ -159,12 +179,6 @@ pub fn run(a: &ViewArgs) -> Result<(), String> {
     if a.header_only {
         return finish(w);
     }
-
-    // AC/AN only need recomputing when the sample set actually changed.
-    let update_info = !a.no_update
-        && !a.drop_genotypes
-        && selected.as_ref().map_or(false, |s| s.len() != hdr.samples.len());
-    let needs_samples = selected.is_some() || a.drop_genotypes || update_info || a.min_ac.is_some();
 
     // With nothing to filter and no sample change, every record line passes
     // through verbatim — so the line loop below would only re-derive the byte
@@ -203,9 +217,75 @@ pub fn run(a: &ViewArgs) -> Result<(), String> {
     let mut info_buf: Vec<u8> = Vec::with_capacity(256);
     let all_samples: Vec<usize> = (0..hdr.samples.len()).collect();
 
+    // Maximal runs of kept samples that are consecutive in the file and kept
+    // in file order; each run is one verbatim byte range of the input line,
+    // and only blocks wholly inside a run can be spliced. A reordered or
+    // duplicated selection has no such runs worth having.
+    let runs: Option<Vec<(usize, usize)>> = selected.as_ref().and_then(|sel| {
+        let first = *sel.first()?;
+        let mut runs = vec![(first, first)];
+        for pair in sel.windows(2) {
+            if pair[1] <= pair[0] {
+                return None;
+            }
+            if pair[1] == pair[0] + 1 {
+                runs.last_mut().unwrap().1 = pair[1];
+            } else {
+                runs.push((pair[1], pair[1]));
+            }
+        }
+        Some(runs)
+    });
+    // Same trade as merge's splicing: the block-keeping reader hands whole
+    // lines over a channel, which only pays once lines span several blocks,
+    // so the cohort must be wide; and the emitted sample bytes must be
+    // verbatim input ranges, so -G is out and a subset needs monotone runs.
+    const SPLICE_MIN_SAMPLES: usize = 16384;
+    let splice_on = a.out.bgzf()?
+        && std::env::var_os("VCFR_NO_SPLICE").is_none()
+        && a.input != "-"
+        && !a.drop_genotypes
+        && hdr.samples.len() >= SPLICE_MIN_SAMPLES
+        && (!needs_samples || runs.is_some())
+        && matches!(detect_compression(&a.input), Ok(Compression::Bgzf));
+    let mut rdr = if splice_on {
+        drop(rdr);
+        let mut s = SplicedLineReader::open(&a.input).map_err(|e| e.to_string())?;
+        // Skip past the header this reader re-reads from the top.
+        let mut skip = Header::default();
+        loop {
+            if !s.advance()? {
+                break;
+            }
+            if skip.feed_line(s.line()).map_err(|e| e.to_string())? {
+                break;
+            }
+        }
+        VReader::Spliced(s)
+    } else {
+        VReader::Plain(rdr)
+    };
+
     let res = (|| -> std::io::Result<()> {
-        while rdr.advance()? {
-            let line = rdr.line();
+        let mut blocks: Vec<InteriorBlock> = Vec::new();
+        #[allow(unused_assignments)]
+        let mut line_owned: Vec<u8> = Vec::new();
+        loop {
+            let more = match &mut rdr {
+                VReader::Plain(r) => r.advance()?,
+                VReader::Spliced(s) => s.advance().map_err(std::io::Error::other)?,
+            };
+            if !more {
+                break;
+            }
+            let line: &[u8] = match &mut rdr {
+                VReader::Plain(r) => r.line(),
+                VReader::Spliced(s) => {
+                    line_owned = s.take_line();
+                    blocks = s.take_blocks();
+                    &line_owned
+                }
+            };
             if line.is_empty() || line[0] == b'#' {
                 continue;
             }
@@ -280,10 +360,20 @@ pub fn run(a: &ViewArgs) -> Result<(), String> {
                 }
             }
 
-            // Fast path: nothing about the record changes, so pass the bytes on.
+            // Fast path: nothing about the record changes, so pass the bytes
+            // on — splicing any interior blocks straight through when the
+            // reader kept them.
             if !needs_samples {
-                w.write_all(line)?;
-                w.write_all(b"\n")?;
+                if blocks.is_empty() {
+                    w.write_all(line)?;
+                    w.write_all(b"\n")?;
+                } else {
+                    buf.clear();
+                    splice_range(line, &mut blocks, 0, line.len(), &mut buf, &mut w)?;
+                    buf.push(b'\n');
+                    w.write_all(&buf)?;
+                    buf.clear();
+                }
                 continue;
             }
 
@@ -312,6 +402,33 @@ pub fn run(a: &ViewArgs) -> Result<(), String> {
             buf.clear();
             if a.drop_genotypes {
                 buf.extend_from_slice(rec.span(line, COL_CHROM, COL_INFO));
+            } else if splice_on && rec.ncols() == FIRST_SAMPLE + hdr.samples.len() {
+                // Head (possibly with rewritten AC/AN) is buffered text; each
+                // kept run of sample columns is a verbatim input range whose
+                // interior blocks splice through compressed.
+                if let Some(c) = counts.as_ref().filter(|_| update_info) {
+                    buf.extend_from_slice(rec.span(line, COL_CHROM, COL_FILTER));
+                    buf.push(b'\t');
+                    info_buf.clear();
+                    rewrite_info(
+                        rec.get(line, COL_INFO),
+                        &[
+                            ("AC", Some(join_u64(&c.ac))),
+                            ("AN", Some(c.an.to_string())),
+                        ],
+                        &mut info_buf,
+                    );
+                    buf.extend_from_slice(&info_buf);
+                } else {
+                    buf.extend_from_slice(rec.span(line, COL_CHROM, COL_INFO));
+                }
+                buf.push(b'\t');
+                buf.extend_from_slice(rec.get(line, COL_FORMAT));
+                for &(c0, c1) in runs.as_ref().expect("splice_on implies runs") {
+                    buf.push(b'\t');
+                    let (ra, rb) = rec.span_range(line.len(), FIRST_SAMPLE + c0, FIRST_SAMPLE + c1);
+                    splice_range(line, &mut blocks, ra, rb, &mut buf, &mut w)?;
+                }
             } else if let Some(c) = counts.filter(|_| update_info) {
                 buf.extend_from_slice(rec.span(line, COL_CHROM, COL_FILTER));
                 buf.push(b'\t');

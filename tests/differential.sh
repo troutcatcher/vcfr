@@ -280,6 +280,31 @@ else
 fi
 pipe_is_silent "wide merge | head is silent" $VCFR merge -O z --threads 4 "$WORK/wa.wide.vcf.gz" "$WORK/wb.wide.vcf.gz"
 
+# view -s on the same wide file: three subset shapes (drop-few keeps long
+# spliceable runs; a contiguous slice is one run; every-2nd has no runs and
+# must fall back), each byte-identical to the unspliced path once inflated.
+bgzip -dc "$WORK/wa.wide.vcf.gz" | grep '^#CHROM' | cut -f10- | tr '\t' '\n' > "$WORK/wide.names"
+{ sed -n '77p' "$WORK/wide.names"; sed -n '15000p' "$WORK/wide.names"; } > "$WORK/wide.drop2"
+sed -n '3000,17000p' "$WORK/wide.names" > "$WORK/wide.slice"
+awk 'NR%2==1' "$WORK/wide.names" > "$WORK/wide.scatter"
+for sub in "^$WORK/wide.drop2" "$WORK/wide.slice" "$WORK/wide.scatter"; do
+  tag=$(basename "${sub#^}")
+  $VCFR view -O z --threads 4 -S "$sub" -o "$WORK/ws.sp.vcf.gz" "$WORK/wa.wide.vcf.gz"
+  VCFR_NO_SPLICE=1 $VCFR view -O z --threads 4 -S "$sub" -o "$WORK/ws.nosp.vcf.gz" "$WORK/wa.wide.vcf.gz"
+  if cmp -s <(bgzip -dc "$WORK/ws.sp.vcf.gz") <(bgzip -dc "$WORK/ws.nosp.vcf.gz"); then
+    echo "ok    wide view -S $tag: spliced output identical"; pass=$((pass+1))
+  else
+    echo "FAIL  wide view -S $tag: spliced output differs"; fail=$((fail+1))
+  fi
+done
+bcftools view "$WORK/ws.sp.vcf.gz" > "$WORK/v.out" 2>"$WORK/v.err"
+if [[ -s "$WORK/v.out" && ! -s "$WORK/v.err" ]]; then
+  echo "ok    wide view: htslib reads spliced BGZF"; pass=$((pass+1))
+else
+  echo "FAIL  wide view: htslib rejects spliced BGZF: $(cat "$WORK/v.err")"; fail=$((fail+1))
+fi
+pipe_is_silent "wide view -S | head is silent" $VCFR view -O z --threads 4 -S "^$WORK/wide.drop2" "$WORK/wa.wide.vcf.gz"
+
 pipe_is_silent "view | head is silent"   $VCFR view "$WORK/all.vcf.gz"
 pipe_is_silent "concat | head is silent" $VCFR concat $PARTS
 pipe_is_silent "concat --naive | head is silent" $VCFR concat --naive -O z $PARTS

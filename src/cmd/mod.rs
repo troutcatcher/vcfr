@@ -124,6 +124,39 @@ pub fn write_or_broken_pipe(w: &mut crate::io::Writer, buf: &[u8]) -> Result<(),
     }
 }
 
+/// Emit the byte range `[a, b)` of `line`, splicing any interior compressed
+/// block lying wholly inside the range through the BGZF writer untouched.
+/// Text between splices accumulates in `buf`, which is flushed (becoming its
+/// own, possibly short, deflate block) before each splice so stream order is
+/// preserved. With no spliceable block in range this degenerates to
+/// `buf.extend_from_slice(&line[a..b])`. Shared by `merge` and `view -s`.
+pub(crate) fn splice_range(
+    line: &[u8],
+    blocks: &mut [crate::bgzf::spliced::InteriorBlock],
+    a: usize,
+    b: usize,
+    buf: &mut Vec<u8>,
+    w: &mut crate::io::Writer,
+) -> io::Result<()> {
+    use std::io::Write;
+    let mut cur = a;
+    for k in blocks.iter_mut() {
+        if k.line_off < a || k.end() > b || k.raw.is_empty() {
+            continue;
+        }
+        debug_assert!(k.line_off >= cur);
+        buf.extend_from_slice(&line[cur..k.line_off]);
+        if !buf.is_empty() {
+            w.write_all(buf)?;
+            buf.clear();
+        }
+        w.splice_block(std::mem::take(&mut k.raw))?;
+        cur = k.end();
+    }
+    buf.extend_from_slice(&line[cur..b]);
+    Ok(())
+}
+
 /// Same treatment for `Writer::write_raw_block`, used by `concat --naive`'s
 /// block-copy loop.
 pub fn write_raw_block_or_broken_pipe(w: &mut crate::io::Writer, block: Vec<u8>) -> Result<(), String> {

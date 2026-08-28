@@ -448,6 +448,20 @@ for measurement. One semantic note: spliced output blocks carry whatever
 compression level the *input* was written at; only re-encoded boundary
 blocks honour `-l`.
 
+`view` splices under the same gate: with no sample change (pure region or
+site filtering of a wide file) every kept line splices whole, and under
+`-s`/`-S` each maximal run of samples kept consecutively and in file order
+is a verbatim byte range whose interior blocks pass through compressed. The
+arithmetic decides when that helps: a block holds ~5,000 GT:DS:GP samples,
+so dropping a handful of animals or keeping a contiguous slice splices
+nearly everything (dropping 3 of 220k measured ~1.3x wall and ~2.2x less
+CPU than recompressing, ~6x bcftools), while a scattered pick (every 2nd
+animal) has runs of ~2 samples and correctly falls back to plain
+recompression. A reordered `-s` list also disables splicing. Fixing the
+verification for this surfaced a conformance gap: `view -s` recomputed
+AC/AN into INFO without declaring them in the header (bcftools declares
+them); it now adds the same header lines bcftools does.
+
 Testing both variants surfaced a real bug, not a benchmark curiosity: `merge`
 and `concat --naive` could each leak a `Broken pipe` failure to stderr and a
 nonzero exit when piped into something that closes early (`| head`), because
