@@ -75,12 +75,17 @@ byte-identical with splicing on or off (`VCFR_NO_SPLICE=1` disables it).
 
 ### † Compression levels: read the BGZF rows carefully
 
-`vcfr` deflates with libdeflate and `bcftools` with zlib, and the two
-disagree about what a level means: at the shared default of 6, libdeflate is
-faster but weaker, so the † rows compare unequal work — vcfr produced a
-larger file. `-l 7` matches bcftools' default output size almost exactly
-(the `-l 7` rows above are the fair matched-ratio comparison). The full
-curve on the generic recompress case, same session:
+Both tools deflate with libdeflate here (this bcftools links
+`libdeflate.so`, as htslib does when built with it), but htslib maps its
+0-9 level scale one notch stronger than libdeflate's own numbering:
+bcftools' default "level 6" produces the same bytes as raw libdeflate
+level 7 (398.9M vs 398.7M on this file), and bcftools `-Oz7` matches
+libdeflate 8 (373.2M vs 372.6M). vcfr's `-l N` is libdeflate's own scale,
+so at the shared default of "6" the † rows compare unequal ratios — vcfr
+produced a larger file. The `-l 7` rows above are the fair matched-ratio
+comparison, and since the codec is then *identical* on both sides, their
+1.5-3x margins measure vcfr's pipeline alone. The full curve on the
+generic recompress case, same session:
 
 | encoder | time | output |
 | --- | ---: | ---: |
@@ -88,7 +93,7 @@ curve on the generic recompress case, same session:
 | `vcfr -l 1` | 3.9s | 498M (+25%) |
 | `vcfr -l 6` (default) | 11.5s | 430M (+8%) |
 | `vcfr -l 7` | 17.8s | 398M (±0%) |
-| `bcftools -Oz` (zlib 6, default) | 26.4s | 398M |
+| `bcftools -Oz` (default; ≡ libdeflate 7) | 26.4s | 398M |
 | `vcfr -l 8` | 37.9s | 372M (−7%) |
 
 Rules of thumb: `-l 0` for scratch and intermediate files (7x faster than
