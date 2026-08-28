@@ -10,7 +10,7 @@ use crate::pool::OrderedPool;
 use crate::vcf::header::{union_meta, Header, Number};
 use crate::vcf::record::*;
 
-use super::{ignore_broken_pipe, merge_threads, resolve_threads, write_or_broken_pipe, OutputOpts};
+use super::{ignore_broken_pipe, merge_threads, resolve_threads, splice_range, write_or_broken_pipe, OutputOpts};
 
 #[derive(clap::Args, Debug)]
 pub struct MergeArgs {
@@ -983,29 +983,13 @@ fn emit_spliced(
             } else {
                 (0, 0)
             };
-            let can_splice = whole_run
-                && blocks[mi].iter().any(|k| k.line_off >= a && k.end() <= b);
-            if can_splice {
+            if whole_run {
                 buf.push(b'\t');
-                let mut cur = a;
-                for k in blocks[mi].iter_mut() {
-                    if k.line_off < a || k.end() > b {
-                        continue;
-                    }
-                    debug_assert!(k.line_off >= cur);
-                    buf.extend_from_slice(&m.line[cur..k.line_off]);
-                    if !buf.is_empty() {
-                        write_or_broken_pipe(w, buf)?;
-                        buf.clear();
-                    }
-                    match w.splice_block(std::mem::take(&mut k.raw)) {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
-                        Err(e) => return Err(e.to_string()),
-                    }
-                    cur = k.end();
+                match splice_range(m.line, &mut blocks[mi], a, b, buf, w) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+                    Err(e) => return Err(e.to_string()),
                 }
-                buf.extend_from_slice(&m.line[cur..b]);
             } else {
                 write_member_cols(m, mi, &plan, ctx, hdr, buf);
             }
